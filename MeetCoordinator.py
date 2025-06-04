@@ -13,7 +13,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # States per group
 listening_sessions = {}  # {chat_id: {user: [messages]}}
 
-# --- COMMANDS ---
+# --- COMMANDS --- test
 
 async def welcome_on_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
