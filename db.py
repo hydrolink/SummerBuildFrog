@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
@@ -15,6 +15,7 @@ class Meeting(Base):
     place = Column(String)
     pax = Column(String)
     activity = Column(String)
+    meet_date = Column(Date) # <- NEW DATE COLUMN
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
