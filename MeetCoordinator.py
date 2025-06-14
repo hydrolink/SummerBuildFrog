@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ChatMemberHandler
 from openai import OpenAI
+from datetime import datetime, date
+import re
+import dateparser
 
 # Load environment variables
 load_dotenv()
@@ -80,6 +83,67 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     listening_sessions[chat_id][user].append(message)
 
 
+# --- DATE EXTRACTION ---
+def extract_meeting_date(original_messages, gpt_summary, current_date=None):
+    """
+    Extract meeting date from original messages and GPT summary with better context awareness
+    """
+    if current_date is None:
+        current_date = date.today()
+    
+    # First, try to extract from original messages (more reliable)
+    all_messages = []
+    for user_messages in original_messages.values():
+        all_messages.extend(user_messages)
+    
+    # Common date patterns people use in chat
+    date_patterns = [
+        r'\b(tomorrow|tmr)\b',
+        r'\b(today|tdy)\b', 
+        r'\b(next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b',
+        r'\b(this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b',
+        r'\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)\b',
+        r'\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b',
+        r'\b(\d{1,2}-\d{1,2}(?:-\d{2,4})?)\b'
+    ]
+    
+    # Try to find date mentions in original messages
+    for message in all_messages:
+        message_lower = message.lower()
+        for pattern in date_patterns:
+            matches = re.findall(pattern, message_lower, re.IGNORECASE)
+            for match in matches:
+                # Parse with current date as reference
+                parsed_date = dateparser.parse(
+                    match, 
+                    settings={
+                        'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
+                        'PREFER_DATES_FROM': 'future'
+                    }
+                )
+                if parsed_date and parsed_date.date() >= current_date:
+                    return parsed_date.date()
+    
+    # If no date found in original messages, try GPT summary as fallback
+    # But be more careful about extraction
+    summary_lower = gpt_summary.lower()
+    
+    # Look for specific date patterns in summary
+    date_in_summary = re.search(r'date:\s*([^\n]+)', summary_lower)
+    if date_in_summary:
+        date_text = date_in_summary.group(1).strip()
+        parsed_date = dateparser.parse(
+            date_text,
+            settings={
+                'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
+                'PREFER_DATES_FROM': 'future'
+            }
+        )
+        if parsed_date and parsed_date.date() >= current_date:
+            return parsed_date.date()
+    
+    return None
+
 # --- PROCESSING WITH GPT ---
 
 async def process_availability(update: Update, chat_id: int):
@@ -87,10 +151,19 @@ async def process_availability(update: Update, chat_id: int):
     if not group_data:
         await update.message.reply_text("❌ No messages were collected.")
         return
+    
+    # Get current date for better context
+    today = date.today()
+    today_str = today.strftime('%A, %B %d, %Y')
 
     prompt = (
+        f"Today is {today_str}. "
         "Summarize the following group chat into meeting suggestions. "
-        "Extract clearly: time, place, pax (people), and activity.\n\n"
+        "Extract clearly: date (be very careful with relative dates like 'next Friday'), time, place, pax (people), and activity.\n\n"
+        "When interpreting dates:\n"
+        "- 'tomorrow' means the day after today\n"
+        "- 'next Friday' means the upcoming Friday after today\n"
+        "- Be precise with date calculations\n\n"
     )
 
     for user, messages in group_data.items():
@@ -107,9 +180,16 @@ async def process_availability(update: Update, chat_id: int):
         )
         summary = response.choices[0].message.content
 
+        # Use improved date extraction
+        meet_date = extract_meeting_date(group_data, summary, today)
+        
+        # If we found a date, add it to the summary for verification
+        if meet_date:
+            summary += f"\n\n✅ **Extracted Date: {meet_date.strftime('%A, %B %d, %Y')}**"
+
         # Save to DB
         db = SessionLocal()
-        meeting = Meeting(chat_id=chat_id, summary=summary)
+        meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date) # added meet_date
         db.add(meeting)
         db.commit()
 
@@ -128,8 +208,11 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reply = "🗂️ *Saved Meetings:*\n\n"
+
+    # newly added
     for m in meetings:
-        reply += f"🆔 {m.id}\n🕒 {m.created_at.strftime('%Y-%m-%d %H:%M')}\n📋 {m.summary[:100]}...\n\n"
+        date_str = m.meet_date.strftime('%Y-%m-%d') if m.meet_date else "Unknown"
+        reply += f"🆔 {m.id}\n 📅 Intended Date: {date_str}\n 🕒 {m.created_at.strftime('%Y-%m-%d %H:%M')}\n📋 {m.summary[:100]}...\n\n"
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 
