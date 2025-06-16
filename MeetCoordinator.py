@@ -7,15 +7,22 @@ from openai import OpenAI
 from datetime import datetime, date
 import re
 import dateparser
+import googlemaps
 
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 
 # States per group
 listening_sessions = {}  # {chat_id: {user: [messages]}}
+
+def escape_markdown_v2(text: str) -> str:
+    escape_chars = r"\_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
 # --- COMMANDS 
 
@@ -144,6 +151,40 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
     
     return None
 
+# --- GOOGLE MAPS ---
+async def get_nearest_mrt(place):
+    try:
+        geo = gmaps.geocode(place)
+        if not geo:
+            return "❌ Could not find location."
+        latlng = geo[0]["geometry"]["location"]
+        lat, lng = latlng["lat"], latlng["lng"]
+        results = gmaps.places_nearby(location=(lat, lng), radius=2000, type='transit_station')
+
+        stations = [r for r in results.get("results", []) if "MRT" in r["name"]]
+        if not stations:
+            results = gmaps.places(query=f"MRT station near {place}")
+            stations = [r for r in results.get("results", []) if "MRT" in r["name"]]
+        if not stations:
+            return "❌ No MRT station nearby."
+
+        station = stations[0]
+        mrt_name = station["name"]
+        dest = station["geometry"]["location"]
+        distance_data = gmaps.distance_matrix(
+            [f"{lat},{lng}"],
+            [f"{dest['lat']},{dest['lng']}"],
+            mode="walking"
+        )
+        element = distance_data["rows"][0]["elements"][0]
+        if element["status"] == "OK":
+            dist = element["distance"]["text"]
+            dur = element["duration"]["text"]
+            return f"{mrt_name} ({dist}, {dur} walk)"
+        return f"{mrt_name} (⚠️ distance unavailable)"
+    except Exception as e:
+        return f"⚠️ MRT error: {str(e)}"
+
 # --- PROCESSING WITH GPT ---
 
 async def process_availability(update: Update, chat_id: int):
@@ -151,8 +192,7 @@ async def process_availability(update: Update, chat_id: int):
     if not group_data:
         await update.message.reply_text("❌ No messages were collected.")
         return
-    
-    # Get current date for better context
+
     today = date.today()
     today_str = today.strftime('%A, %B %d, %Y')
 
@@ -180,23 +220,44 @@ async def process_availability(update: Update, chat_id: int):
         )
         summary = response.choices[0].message.content
 
-        # Use improved date extraction
+        # Extract the date from messages and GPT output
         meet_date = extract_meeting_date(group_data, summary, today)
-        
-        # If we found a date, add it to the summary for verification
         if meet_date:
             summary += f"\n\n✅ **Extracted Date: {meet_date.strftime('%A, %B %d, %Y')}**"
 
+        # Try to extract place line and fetch nearest MRT
+        place = None
+        for line in summary.split('\n'):
+            if "place" in line.lower():
+                place = line.split(":")[-1].strip()
+                break
+
+        if place:
+            mrt_info = await get_nearest_mrt(place)
+
+            new_lines = []
+            for line in summary.split('\n'):
+                if "place" in line.lower():
+                    new_line = f"{line.strip()} (Nearest MRT = {mrt_info})"
+                    new_lines.append(new_line)
+                else:
+                    new_lines.append(line)
+            summary = "\n".join(new_lines)
+
         # Save to DB
         db = SessionLocal()
-        meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date) # added meet_date
+        meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date)
         db.add(meeting)
         db.commit()
 
-        await update.message.reply_text("📋 *Final Summary *:\n\n" + summary, parse_mode="Markdown")
+        escaped = escape_markdown_v2("📋 *Final Summary:*\n\n" + summary)
+        await update.message.reply_text(escaped, parse_mode="MarkdownV2")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Error processing with GPT: {str(e)}")
+        error_msg = getattr(e, 'response', str(e))
+        await update.message.reply_text(f"❌ Error processing with GPT:\n{error_msg}")
+
+
 
 async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
