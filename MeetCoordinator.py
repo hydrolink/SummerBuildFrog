@@ -8,6 +8,9 @@ from datetime import datetime, date
 import re
 import dateparser
 import googlemaps
+from urllib.parse import quote
+
+editing_sessions = {}
 
 # Load environment variables
 load_dotenv()
@@ -87,16 +90,52 @@ async def stop_listening(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id not in listening_sessions:
-        return  # Only record if listening is active
+    user_id = update.effective_user.id
+    text = update.message.text
 
-    user = update.message.from_user.full_name
-    message = update.message.text
+    # --- Editing flow ---
+    if user_id in editing_sessions:
+        session = editing_sessions[user_id]
+        step = session['step']
+        db = SessionLocal()
+        meeting = db.query(Meeting).filter_by(id=session['meeting_id']).first()
 
-    if user not in listening_sessions[chat_id]:
-        listening_sessions[chat_id][user] = []
+        if step == 'choose_field':
+            if text.lower() not in ['date', 'time', 'place', 'pax', 'activity']:
+                await update.message.reply_text("❌ Invalid field. Please choose from `date`, `time`, `place`, `pax`, or `activity`.")
+                return
+            session['field'] = text.lower()
+            session['step'] = 'enter_value'
+            await update.message.reply_text(f"✏️ Please enter the new value for *{text}*:", parse_mode="Markdown")
+            return
 
-    listening_sessions[chat_id][user].append(message)
+        elif step == 'enter_value':
+            field = session['field']
+            lines = meeting.summary.split('\n')
+            updated_lines = []
+
+            for line in lines:
+                if field in line.lower():
+                    prefix = line.split(':')[0]
+                    updated_lines.append(f"{prefix}: {text}")
+                else:
+                    updated_lines.append(line)
+
+            meeting.summary = '\n'.join(updated_lines)
+            db.commit()
+            del editing_sessions[user_id]
+
+            await update.message.reply_text("✅ Meeting updated successfully!")
+            return
+
+    # --- Listening mode ---
+    if chat_id in listening_sessions:
+        user = update.message.from_user.full_name
+        message = update.message.text
+        if user not in listening_sessions[chat_id]:
+            listening_sessions[chat_id][user] = []
+        listening_sessions[chat_id][user].append(message)
+
 
 
 # --- DATE EXTRACTION ---
@@ -140,24 +179,20 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
                 if parsed_date and parsed_date.date() >= current_date:
                     return parsed_date.date()
     
-    # If no date found in original messages, try GPT summary as fallback
-    # But be more careful about extraction
-    summary_lower = gpt_summary.lower()
-    
-    # Look for specific date patterns in summary
-    date_in_summary = re.search(r'date:\s*([^\n]+)', summary_lower)
-    if date_in_summary:
-        date_text = date_in_summary.group(1).strip()
-        parsed_date = dateparser.parse(
-            date_text,
-            settings={
-                'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
-                'PREFER_DATES_FROM': 'future'
-            }
-        )
-        if parsed_date and parsed_date.date() >= current_date:
-            return parsed_date.date()
-    
+        # NEW — find line that starts with 📅 Date:
+    for line in gpt_summary.splitlines():
+        if line.strip().startswith("📅 Date:"):
+            date_text = line.split("📅 Date:")[1].strip()
+            parsed_date = dateparser.parse(
+                date_text,
+                settings={
+                    'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
+                    'PREFER_DATES_FROM': 'future'
+                }
+            )
+            if parsed_date and parsed_date.date() >= current_date:
+                return parsed_date.date()
+            break  # stop after the first valid 📅 Date
     return None
 
 # --- GOOGLE MAPS ---
@@ -282,8 +317,13 @@ async def process_availability(update: Update, chat_id: int):
         db.add(meeting)
         db.commit()
 
-        final_message = f"📋 Final Summary:\n\n{summary}"
-        await update.message.reply_text(final_message)
+        sync_link = f"{os.getenv('DOMAIN_BASE_URL')}/login?telegram_id={update.effective_user.id}&meeting_id={meeting.id}"
+        final_message = (
+            f"📋 Final Summary:\n\n{summary}\n\n"
+            f"🔗 [🗓️ Click here to add to Outlook Calendar]({sync_link})"
+        )
+
+        await update.message.reply_text(final_message, parse_mode="Markdown", disable_web_page_preview=True)
 
 
     except Exception as e:
@@ -303,12 +343,76 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply = "🗂️ *Saved Meetings:*\n\n"
 
-    # newly added
     for m in meetings:
-        date_str = m.meet_date.strftime('%Y-%m-%d') if m.meet_date else "Unknown"
-        reply += f"🆔 {m.id}\n 📅 Intended Date: {date_str}\n 🕒 {m.created_at.strftime('%Y-%m-%d %H:%M')}\n📋 {m.summary[:100]}...\n\n"
+        date_str = m.meet_date.strftime('%A, %B %d, %Y') if m.meet_date else "Unknown"
+        created_str = m.created_at.strftime('%Y-%m-%d %H:%M')
+
+        # Convert escaped \n into actual line breaks
+        clean_summary = m.summary.replace("\\n", "\n")
+
+        # Extract fields from cleaned summary
+        details = {
+            "📅 Date": "Not found",
+            "🕒 Time": "Not found",
+            "📍 Place": "Not found",
+            "🚇 Nearest MRT": "Not found",
+            "👥 Pax": "Not found",
+            "🎯 Activity": "Not found"
+        }
+
+        for line in clean_summary.splitlines():
+            for key in details:
+                if line.strip().startswith(key):
+                    details[key] = line[len(key)+1:].strip()
+
+        reply += (
+            f"🆔 *ID:* `{m.id}`\n"
+            f"📌 *Created:* {created_str}\n"
+            f"📅 *Date:* {details['📅 Date']}\n"
+            f"🕒 *Time:* {details['🕒 Time']}\n"
+            f"📍 *Place:* {details['📍 Place']}\n"
+            f"🚇 *MRT:* {details['🚇 Nearest MRT']}\n"
+            f"👥 *Pax:* {details['👥 Pax']}\n"
+            f"🎯 *Activity:* {details['🎯 Activity']}\n"
+            "───────────────\n"
+        )
 
     await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+
+
+async def start_edit_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("❓ Please provide the meeting ID.\nExample: /editmeeting 3")
+        return
+
+    try:
+        meeting_id = int(args[0])
+        db = SessionLocal()
+        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+        if not meeting:
+            await update.message.reply_text("❌ Meeting not found.")
+            return
+
+        user_id = update.effective_user.id
+        editing_sessions[user_id] = {
+            'step': 'choose_field',
+            'meeting_id': meeting_id
+        }
+
+        await update.message.reply_text(
+            f"📋 You're editing Meeting ID: {meeting_id}\n\n"
+            "Which field do you want to update?\n"
+            "`date`, `time`, `place`, `pax`, or `activity`",
+            parse_mode="Markdown"
+        )
+
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid meeting ID.")
+
+
 
 async def delete_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -340,7 +444,7 @@ app.add_handler(CommandHandler("startlistening", start_listening))
 app.add_handler(CommandHandler("stoplistening", stop_listening))
 app.add_handler(CommandHandler("listmeetings", list_meetings))
 app.add_handler(CommandHandler("deletemeeting", delete_meeting))
-
+app.add_handler(CommandHandler("editmeeting", start_edit_meeting))
 
 # Passive message tracking
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
