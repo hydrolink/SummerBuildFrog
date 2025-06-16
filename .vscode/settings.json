@@ -29,5 +29,7 @@
         "env.bak{,/**}",
         "venv.bak{,/**}",
         ".vscode{,/**}"
-    ]
+    ],
+    "appService.defaultWebAppToDeploy": "/subscriptions/b494dd2e-1ac2-4d28-9706-46747da50270/resourceGroups/meetingbot-fastapi_group/providers/Microsoft.Web/sites/meetingbot-fastapi",
+    "appService.deploySubpath": "."
 }
