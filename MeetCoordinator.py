@@ -32,20 +32,29 @@ async def welcome_on_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_status == "member":  # or "administrator" if added as admin
             chat = update.effective_chat
             await context.bot.send_message(
-                chat.id,
-                "👋 Hello everyone! I'm **@coordinator_meetbot**, your group's friendly meeting scheduler bot.\n\n"
-                "📌 *What I do:*\n"
-                "I help you summarize group discussions into clear meetup plans — including time, place, people, and activity.\n\n"
-                "▶️ *How to use me:*\n"
-                "1. Type `/startlistening` to begin tracking everyone's messages.\n"
-                "2. Chat as usual about when and where to meet.\n"
-                "3. Type `/stoplistening` to stop and get a smart summary powered by AI.\n\n"
-                "🧠 *Bonus commands:*\n"
-                "`/listmeetings` – See all past meeting summaries\n"
-                "`/deletemeeting <id>` – Remove an old summary\n\n"
-                "🔒 I only listen when you tell me to. Let's make planning simple! 🎯",
-                parse_mode="Markdown"
-            )
+            chat.id,
+            escape_markdown_v2(
+                "👋 *Welcome to your group’s personal meeting assistant\\!* I'm \\@coordinator\\_meetbot — your AI scheduler\\. 🧠🤖\n\n"
+                "📌 *Here’s how I can help:*\n"
+                "I listen to your group chat and generate smart summaries for your meetups\\. This includes:\n"
+                "• 📅 *Date*\n"
+                "• 🕒 *Time*\n"
+                "• 📍 *Place* with nearest MRT info\n"
+                "• 👥 *Attendees*\n"
+                "• 🎯 *Activity*\n\n"
+                "▶️ *To get started:*\n"
+                "1\\. Type `/startlistening` — I’ll start collecting messages\\.\n"
+                "2\\. Chat naturally about your meeting plans\\.\n"
+                "3\\. Type `/stoplistening` — I’ll process everything and summarize\\.\n\n"
+                "🧠 *Other useful commands:*\n"
+                "`/listmeetings` – View all previous summaries\n"
+                "`/deletemeeting <id>` – Delete a saved summary\n\n"
+                "🔒 I *only listen* when you explicitly tell me to\\.\n"
+                "Let’s make planning smooth and stress\\-free\\. 🗓️✨"
+            ),
+            parse_mode="MarkdownV2"
+        )
+
 
     except Exception as e:
         print("Error in welcome message:", e)
@@ -204,6 +213,14 @@ async def process_availability(update: Update, chat_id: int):
         "- 'tomorrow' means the day after today\n"
         "- 'next Friday' means the upcoming Friday after today\n"
         "- Be precise with date calculations\n\n"
+        "Please summarize the group chat into a Meeting Summary using this exact format:\n\n"
+        "📅 Date: <date>\n"
+        "🕒 Time: <time>\n"
+        "📍 Place: <place>\n"
+        "🚇 Nearest MRT: <nearest_mrt_info>\n"
+        "👥 Pax: <number_of_people>\n"
+        "🎯 Activity: <activity>\n\n"
+        "Do not use HTML or Markdown formatting."
     )
 
     for user, messages in group_data.items():
@@ -234,15 +251,30 @@ async def process_availability(update: Update, chat_id: int):
 
         if place:
             mrt_info = await get_nearest_mrt(place)
+            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={place.replace(' ', '+')}"
+
+            try:
+                geocode_result = gmaps.geocode(place)
+                if geocode_result:
+                    location = geocode_result[0]["geometry"]["location"]
+                    lat, lng = location["lat"], location["lng"]
+
+                    # Send a Telegram location message
+                    await update.message.reply_location(latitude=lat, longitude=lng)
+            except Exception as e:
+                print(f"⚠️ Failed to send location: {e}")
+
 
             new_lines = []
             for line in summary.split('\n'):
                 if "place" in line.lower():
                     new_line = f"{line.strip()} (Nearest MRT = {mrt_info})"
                     new_lines.append(new_line)
+                    new_lines.append(f"🌐 Map: {google_maps_url}")
                 else:
                     new_lines.append(line)
             summary = "\n".join(new_lines)
+
 
         # Save to DB
         db = SessionLocal()
@@ -250,8 +282,9 @@ async def process_availability(update: Update, chat_id: int):
         db.add(meeting)
         db.commit()
 
-        escaped = escape_markdown_v2("📋 *Final Summary:*\n\n" + summary)
-        await update.message.reply_text(escaped, parse_mode="MarkdownV2")
+        final_message = f"📋 Final Summary:\n\n{summary}"
+        await update.message.reply_text(final_message)
+
 
     except Exception as e:
         error_msg = getattr(e, 'response', str(e))
