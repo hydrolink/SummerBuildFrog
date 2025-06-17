@@ -246,7 +246,7 @@ async def process_availability(update: Update, chat_id: int):
         "Extract clearly: date (be very careful with relative dates like 'next Friday'), time, place, pax (people), and activity.\n\n"
         "When interpreting dates:\n"
         "- 'tomorrow' means the day after today\n"
-        "- 'next Friday' means the upcoming Friday after today\n"
+        "- 'next Friday' means the next week Friday after this Friday\n"
         "- Be precise with date calculations\n\n"
         "Please summarize the group chat into a Meeting Summary using this exact format:\n\n"
         "📅 Date: <date>\n"
