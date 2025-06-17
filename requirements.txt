@@ -18,3 +18,7 @@ uvicorn>=0.23.0
 requests>=2.31.0
 
 itsdangerous>=2.0.0
+
+# Scheduling and Timezone Support
+apscheduler>=3.10.0
+pytz>=2023.3
