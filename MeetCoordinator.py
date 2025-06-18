@@ -304,33 +304,109 @@ async def get_nearest_mrt(place):
         geo = gmaps.geocode(place)
         if not geo:
             return "❌ Could not find location."
+
         latlng = geo[0]["geometry"]["location"]
         lat, lng = latlng["lat"], latlng["lng"]
-        results = gmaps.places_nearby(location=(lat, lng), radius=2000, type='transit_station')
 
-        stations = [r for r in results.get("results", []) if "MRT" in r["name"]]
+        # Search for transit stations within 2km
+        results = gmaps.places_nearby(location=(lat, lng), radius=2000, type="subway_station")
+        stations = results.get("results", [])
+
+        # If no subway_station found, try transit_station but filter for MRT in name
         if not stations:
-            results = gmaps.places(query=f"MRT station near {place}")
-            stations = [r for r in results.get("results", []) if "MRT" in r["name"]]
+            results = gmaps.places_nearby(location=(lat, lng), radius=2000, type="transit_station")
+            candidates = results.get("results", [])
+            # Filter to names containing "MRT" or known MRT keywords
+            stations = [s for s in candidates if "mrt" in s["name"].lower()]
+
         if not stations:
             return "❌ No MRT station nearby."
 
-        station = stations[0]
-        mrt_name = station["name"]
-        dest = station["geometry"]["location"]
-        distance_data = gmaps.distance_matrix(
-            [f"{lat},{lng}"],
-            [f"{dest['lat']},{dest['lng']}"],
-            mode="walking"
-        )
-        element = distance_data["rows"][0]["elements"][0]
-        if element["status"] == "OK":
+        # Find closest station by walking distance
+        min_dist = None
+        closest_station = None
+
+        for station in stations:
+            dest = station["geometry"]["location"]
+            distance_data = gmaps.distance_matrix(
+                [f"{lat},{lng}"],
+                [f"{dest['lat']},{dest['lng']}"],
+                mode="walking"
+            )
+            element = distance_data["rows"][0]["elements"][0]
+            if element["status"] == "OK":
+                dist_val = element["distance"]["value"]
+                if (min_dist is None) or (dist_val < min_dist):
+                    min_dist = dist_val
+                    closest_station = (station, element)
+
+        if closest_station:
+            station, element = closest_station
             dist = element["distance"]["text"]
             dur = element["duration"]["text"]
+            mrt_name = station["name"]
             return f"{mrt_name} ({dist}, {dur} walk)"
-        return f"{mrt_name} (⚠️ distance unavailable)"
+
+        return f"{stations[0]['name']} (⚠️ distance unavailable)"
+
     except Exception as e:
         return f"⚠️ MRT error: {str(e)}"
+
+
+
+async def find_nearest_bus_stop(location_name):
+    try:
+        geocode_result = gmaps.geocode(location_name)
+        if not geocode_result:
+            return "❌ No bus stop nearby."
+
+        location = geocode_result[0]["geometry"]["location"]
+        latlng = (location["lat"], location["lng"])
+
+        # Increase radius to 1000 meters for better coverage
+        nearby_places = gmaps.places_nearby(
+            location=latlng,
+            radius=1000,
+            keyword="bus stop",
+            type="transit_station"
+        )
+
+        results = nearby_places.get("results", [])
+        if not results:
+            return "❌ No bus stop nearby."
+
+        # Find closest by walking distance
+        min_dist = None
+        closest_stop = None
+
+        for stop in results:
+            dest = stop["geometry"]["location"]
+            distance_data = gmaps.distance_matrix(
+                [f"{latlng[0]},{latlng[1]}"],
+                [f"{dest['lat']},{dest['lng']}"],
+                mode="walking"
+            )
+            element = distance_data["rows"][0]["elements"][0]
+            if element["status"] == "OK":
+                dist_val = element["distance"]["value"]
+                if (min_dist is None) or (dist_val < min_dist):
+                    min_dist = dist_val
+                    closest_stop = (stop, element)
+
+        if closest_stop:
+            stop, element = closest_stop
+            dist = element["distance"]["text"]
+            dur = element["duration"]["text"]
+            return f"🚌 {stop['name']} ({dist}, {dur} walk)"
+
+        return f"🚌 {results[0]['name']} (⚠️ distance unavailable)"
+
+    except Exception as e:
+        print(f"Bus stop error: {e}")
+        return "❌ Error occurred during bus stop search."
+
+
+
 
 # --- PROCESSING WITH GPT ---
 
@@ -356,6 +432,7 @@ async def process_availability(update: Update, chat_id: int):
         "🕒 Time: <time>\n"
         "📍 Place: <place>\n"
         "🚇 Nearest MRT: <nearest_mrt_info>\n"
+        "🚌 Nearest Bus Stop: <bus_stop_info>\n"
         "👥 Pax: <number_of_people>\n"
         "🎯 Activity: <activity>\n\n"
         "Do not use HTML or Markdown formatting."
