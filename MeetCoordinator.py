@@ -454,8 +454,6 @@ async def process_availability(update: Update, chat_id: int):
 
         # Extract the date from messages and GPT output
         meet_date = extract_meeting_date(group_data, summary, today)
-        if meet_date:
-            summary += f"\n\n✅ **Extracted Date: {meet_date.strftime('%A, %B %d, %Y')}**"
 
         # Try to extract place line and fetch nearest MRT
         place = None

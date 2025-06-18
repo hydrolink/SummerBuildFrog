@@ -2,26 +2,26 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, D
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, date
 
-# Define base and engine
+# Base and engine setup
 Base = declarative_base()
 engine = create_engine("sqlite:///meetings.db", echo=False)
 SessionLocal = sessionmaker(bind=engine)
 
-# Define Meeting model
+# Meeting model
 class Meeting(Base):
     __tablename__ = "meetings"
 
     id = Column(Integer, primary_key=True, index=True)
     chat_id = Column(Integer, index=True)
-    summary = Column(Text)                # Full summary text
-    time = Column(String, nullable=True)  # Optional: extracted time (e.g., 3 PM)
-    place = Column(String, nullable=True) # Optional: extracted place (e.g., Starbucks)
-    pax = Column(String, nullable=True)   # Optional: number or list of people
-    activity = Column(String, nullable=True)  # Optional: e.g., "study session"
-    meet_date = Column(Date, nullable=True)   # Extracted meetup date
+    summary = Column(Text)
+    time = Column(String, nullable=True)
+    place = Column(String, nullable=True)
+    pax = Column(String, nullable=True)
+    activity = Column(String, nullable=True)
+    meet_date = Column(Date, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Define OutlookToken model
+# OutlookToken model
 class OutlookToken(Base):
     __tablename__ = "outlook_tokens"
 
@@ -32,10 +32,11 @@ class OutlookToken(Base):
     expires_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+# Table creation
+def init_db():
+    Base.metadata.create_all(bind=engine)
 
-# Helper function to create a meeting and return its ID
+# Optional helper function
 def create_meeting(chat_id: int, summary: str, time: str = None, place: str = None,
                    pax: str = None, activity: str = None, meet_date: date = None) -> int:
     db = SessionLocal()
@@ -53,3 +54,8 @@ def create_meeting(chat_id: int, summary: str, time: str = None, place: str = No
     db.refresh(meeting)
     db.close()
     return meeting.id
+
+# Only run if this file is executed directly
+if __name__ == "__main__":
+    init_db()
+    print("✅ Database and tables initialized.")

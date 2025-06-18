@@ -1,14 +1,20 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
-import os, requests, base64, json
+import os, requests, base64, json, logging, sys
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from db import SessionLocal, OutlookToken, Meeting
 
+# Load environment variables
 load_dotenv()
 
+# Logging setup
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s - %(asctime)s - %(message)s")
+logger = logging.getLogger("uvicorn")
+
+# Microsoft Graph settings
 CLIENT_ID = os.getenv("MS_CLIENT_ID")
 CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("MS_REDIRECT_URI")
@@ -16,14 +22,13 @@ TENANT_ID = os.getenv("MS_TENANT_ID") or "common"
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES = ["https://graph.microsoft.com/Calendars.ReadWrite", "offline_access", "User.Read"]
 
+# FastAPI app
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="any-random-secret")
-
 
 @app.get("/")
 async def home():
     return HTMLResponse("<a href='/login'>🔗 Connect Outlook Calendar</a>")
-
 
 @app.get("/login")
 async def login(request: Request):
@@ -33,16 +38,13 @@ async def login(request: Request):
     if not telegram_user_id or not meeting_id:
         return HTMLResponse("⚠️ Missing telegram_id or meeting_id")
 
-    print("🔎 Received telegram_id:", telegram_user_id)
-    print("🔎 Received meeting_id:", meeting_id)
+    logger.info(f"🔎 Received telegram_id: {telegram_user_id}")
+    logger.info(f"🔎 Received meeting_id: {meeting_id}")
 
-    state_payload = json.dumps({
-        "telegram_id": telegram_user_id,
-        "meeting_id": meeting_id
-    })
+    state_payload = json.dumps({"telegram_id": telegram_user_id, "meeting_id": meeting_id})
     state_encoded = base64.urlsafe_b64encode(state_payload.encode()).decode().rstrip("=")
 
-    print("🔐 Encoded state:", state_encoded)
+    logger.info(f"🔐 Encoded state: {state_encoded}")
 
     params = {
         "client_id": CLIENT_ID,
@@ -54,9 +56,8 @@ async def login(request: Request):
     }
 
     url = f"{AUTHORITY}/oauth2/v2.0/authorize?{urlencode(params)}"
-    print("🔗 Redirecting to:", url)
+    logger.info(f"🔗 Redirecting to: {url}")
     return RedirectResponse(url)
-
 
 @app.get("/callback")
 async def callback(request: Request, code: str = None, state: str = None):
@@ -64,19 +65,18 @@ async def callback(request: Request, code: str = None, state: str = None):
         return HTMLResponse("❌ Authorization failed")
 
     try:
-        print("📥 Raw state received:", state)
+        logger.info(f"📥 Raw state received: {state}")
         padded_state = state + '=' * (-len(state) % 4)
-        print("📥 Padded state:", padded_state)
-
+        logger.info(f"📥 Padded state: {padded_state}")
         state_json = base64.urlsafe_b64decode(padded_state.encode()).decode()
-        print("📥 Decoded state JSON:", state_json)
-
+        logger.info(f"📥 Decoded state JSON: {state_json}")
         state_data = json.loads(state_json)
         telegram_user_id = state_data["telegram_id"]
         meeting_id = int(state_data["meeting_id"])
-        print("✅ Parsed telegram_id:", telegram_user_id)
-        print("✅ Parsed meeting_id:", meeting_id)
+        logger.info(f"✅ Parsed telegram_id: {telegram_user_id}")
+        logger.info(f"✅ Parsed meeting_id: {meeting_id}")
     except Exception as e:
+        logger.error(f"⚠️ Invalid state format: {e}")
         return HTMLResponse(f"⚠️ Invalid state format: {e}")
 
     token_data = {
@@ -92,6 +92,7 @@ async def callback(request: Request, code: str = None, state: str = None):
         token_response = requests.post(f"{AUTHORITY}/oauth2/v2.0/token", data=token_data)
         token_json = token_response.json()
     except Exception as e:
+        logger.error(f"❌ Token exchange failed: {e}")
         return HTMLResponse(f"❌ Token exchange failed: {e}")
 
     access_token = token_json.get("access_token")
@@ -100,14 +101,14 @@ async def callback(request: Request, code: str = None, state: str = None):
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
     if not access_token:
-        print("❌ Full token response:", token_json)
+        logger.error(f"❌ Full token response: {token_json}")
         return HTMLResponse(f"❌ Token error: {token_json}")
 
     db = SessionLocal()
     meeting = db.query(Meeting).filter_by(id=meeting_id).first()
     if not meeting:
+        logger.error(f"❌ Meeting not found for ID: {meeting_id}")
         db.close()
-        print("❌ Meeting not found for ID:", meeting_id)
         return HTMLResponse("❌ Meeting not found")
 
     existing = db.query(OutlookToken).filter_by(telegram_user_id=telegram_user_id).first()
@@ -131,6 +132,7 @@ async def callback(request: Request, code: str = None, state: str = None):
         )
     except ValueError:
         db.close()
+        logger.error("⚠️ Invalid time format in DB")
         return HTMLResponse("⚠️ Invalid time format in DB")
 
     end_dt = start_dt + timedelta(hours=1)
@@ -156,14 +158,29 @@ async def callback(request: Request, code: str = None, state: str = None):
         )
     except Exception as e:
         db.close()
+        logger.error(f"❌ Calendar API error: {e}")
         return HTMLResponse(f"❌ Calendar API error: {e}")
 
-    if event_response.status_code != 201:
-        print("❌ Event creation failed:", event_response.text)
-
-    db.close()
-
     if event_response.status_code == 201:
+        event = event_response.json()
+        logger.info("✅ Event successfully created:")
+        logger.info(f"🆔 ID: {event.get('id')}")
+        logger.info(f"📅 Subject: {event.get('subject')}")
+        logger.info(f"📆 Starts: {event.get('start')}")
+        logger.info(f"📆 Ends: {event.get('end')}")
+        logger.info(f"📍 Location: {event.get('location', {}).get('displayName')}")
+        logger.info(f"📝 Body: {event.get('body', {}).get('content')}")
+
+        test_response = requests.get(
+            "https://graph.microsoft.com/v1.0/me/calendar/events",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        logger.info("📋 Events fetched from calendar:")
+        logger.info(json.dumps(test_response.json(), indent=2))
+
+        db.close()
         return HTMLResponse("✅ Event created and added to your Outlook Calendar.")
     else:
+        logger.error(f"❌ Event creation failed: {event_response.text}")
+        db.close()
         return HTMLResponse(f"⚠️ Token saved but event creation failed: {event_response.text}")
