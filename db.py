@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, Date
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, date
 import os
@@ -17,7 +17,7 @@ SessionLocal = sessionmaker(bind=engine)
 class Meeting(Base):
     __tablename__ = "meetings"
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(Integer, index=True)
+    chat_id = Column(BigInteger, index=True)  # ✅ Updated
     summary = Column(Text)
     time = Column(String, nullable=True)
     place = Column(String, nullable=True)
@@ -29,7 +29,7 @@ class Meeting(Base):
 class OutlookToken(Base):
     __tablename__ = "outlook_tokens"
     id = Column(Integer, primary_key=True, index=True)
-    telegram_user_id = Column(String, unique=True, index=True)
+    telegram_user_id = Column(BigInteger, unique=True, index=True)  # ✅ Updated
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text)
     expires_at = Column(DateTime)
