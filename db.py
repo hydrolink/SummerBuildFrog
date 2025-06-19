@@ -1,16 +1,21 @@
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, date
+import os
+from dotenv import load_dotenv
 
-# Base and engine setup
+load_dotenv()
+
+# Use Railway PostgreSQL URL from your .env
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g., postgresql://...
+
 Base = declarative_base()
-engine = create_engine("sqlite:///meetings.db", echo=False)
+engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
 
-# Meeting model
+# Define models
 class Meeting(Base):
     __tablename__ = "meetings"
-
     id = Column(Integer, primary_key=True, index=True)
     chat_id = Column(Integer, index=True)
     summary = Column(Text)
@@ -21,10 +26,8 @@ class Meeting(Base):
     meet_date = Column(Date, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# OutlookToken model
 class OutlookToken(Base):
     __tablename__ = "outlook_tokens"
-
     id = Column(Integer, primary_key=True, index=True)
     telegram_user_id = Column(String, unique=True, index=True)
     access_token = Column(Text, nullable=False)
@@ -32,30 +35,10 @@ class OutlookToken(Base):
     expires_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Table creation
+# Initialize tables
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# Optional helper function
-def create_meeting(chat_id: int, summary: str, time: str = None, place: str = None,
-                   pax: str = None, activity: str = None, meet_date: date = None) -> int:
-    db = SessionLocal()
-    meeting = Meeting(
-        chat_id=chat_id,
-        summary=summary,
-        time=time,
-        place=place,
-        pax=pax,
-        activity=activity,
-        meet_date=meet_date
-    )
-    db.add(meeting)
-    db.commit()
-    db.refresh(meeting)
-    db.close()
-    return meeting.id
-
-# Only run if this file is executed directly
 if __name__ == "__main__":
     init_db()
     print("✅ Database and tables initialized.")

@@ -8,16 +8,17 @@ dateparser>=1.1.0
 
 # Database
 SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.9
 
 # Google Maps API
 googlemaps>=4.10.0
 
 # Microsoft Outlook Calendar Integration (OAuth + Web Server)
 fastapi>=0.100.0
-uvicorn>=0.23.0
+uvicorn[standard]>=0.23.0
 requests>=2.31.0
-
 itsdangerous>=2.0.0
+gunicorn>=21.2.0
 
 # Scheduling and Timezone Support
 apscheduler>=3.10.0
