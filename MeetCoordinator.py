@@ -34,15 +34,14 @@ def escape_markdown_v2(text: str) -> str:
     escape_chars = r"\_*[]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
-async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int):
-    """Send reminder message 12 hours before meeting"""
+async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int, reminder_time_note: str = "Your meeting is in 12 hours!"):
     try:
         reminder_message = (
             "⏰ **MEETING REMINDER** ⏰\n\n"
-            "Your meeting is in 12 hours!\n\n"
+            f"{reminder_time_note}\n\n"
             f"📋 **Meeting Details:**\n{meeting_summary}\n\n"
         )
-        
+
         await bot.send_message(
             chat_id=chat_id,
             text=reminder_message,
@@ -50,17 +49,17 @@ async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int
             disable_web_page_preview=True
         )
         print(f"✅ Reminder sent for meeting ID {meeting_id} to chat {chat_id}")
-        
+
     except Exception as e:
         print(f"❌ Failed to send reminder for meeting {meeting_id}: {e}")
 
+
 def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int):
-    """Schedule a reminder 12 hours before the meeting or 5 minutes from now if it's too close."""
     try:
         now = datetime.now(pytz.timezone('Asia/Singapore'))
         reminder_time = meeting_datetime - timedelta(hours=12)
+        reminder_note = "Your meeting is in 12 hours!"
 
-        # If too late to schedule 12h reminder, fallback to 5 minutes from now if meeting is still upcoming
         if reminder_time <= now:
             if meeting_datetime <= now:
                 print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
@@ -68,12 +67,12 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
             else:
                 print(f"⚠️ 12-hour reminder too late for meeting {meeting_id}. Scheduling in 5 minutes.")
                 reminder_time = now + timedelta(minutes=5)
+                reminder_note = "Your meeting is starting soon (in less than 12 hours)!"
 
-        # Schedule the reminder
         scheduler.add_job(
             send_reminder,
             trigger=DateTrigger(run_date=reminder_time),
-            args=[bot, chat_id, meeting_summary, meeting_id],
+            args=[bot, chat_id, meeting_summary, meeting_id, reminder_note],
             id=f"reminder_{meeting_id}",
             replace_existing=True
         )
@@ -82,6 +81,7 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
 
     except Exception as e:
         print(f"❌ Failed to schedule reminder for meeting {meeting_id}: {e}")
+
 
 def extract_time_from_summary(summary: str) -> str:
     """Extract time from meeting summary"""
