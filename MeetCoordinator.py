@@ -689,7 +689,7 @@ async def main():
     app.add_handler(CommandHandler("deletemeeting", delete_meeting))
     app.add_handler(CommandHandler("editmeeting", start_edit_meeting))
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder))
-    app.add_handler(CommandHandler("clearmeetings", clear_meetings))  # ✅ New command
+    app.add_handler(CommandHandler("clearmeetings", delete_all_meetings))  # ✅ New command
 
     # Passive message tracking
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
