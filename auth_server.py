@@ -5,7 +5,9 @@ import os, requests, base64, json, logging, sys
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
 from db import SessionLocal, OutlookToken, Meeting
+from dateutil import parser
 
 # Load environment variables
 load_dotenv()
@@ -26,9 +28,35 @@ SCOPES = ["https://graph.microsoft.com/Calendars.ReadWrite", "offline_access", "
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="any-random-secret")
 
+
+# --- Helper functions ---
+
+def generate_title_from_summary(summary: str) -> str:
+    lines = summary.splitlines()
+    for line in lines:
+        if line.strip().startswith("📍 Place:"):
+            return "Meeting at " + line.split("📍 Place:")[1].strip().split(" (")[0]
+    return "Meeting"
+
+def extract_time_from_summary(summary: str) -> str:
+    lines = summary.splitlines()
+    for line in lines:
+        if line.strip().startswith("🕒 Time:"):
+            time_str = line.split("🕒 Time:")[1].strip()
+            try:
+                dt = parser.parse(time_str)
+                return dt.strftime("%H:%M")
+            except:
+                return "10:00"
+    return "10:00"
+
+
+# --- Routes ---
+
 @app.get("/")
 async def home():
     return HTMLResponse("<a href='/login'>🔗 Connect Outlook Calendar</a>")
+
 
 @app.get("/login")
 async def login(request: Request):
@@ -44,8 +72,6 @@ async def login(request: Request):
     state_payload = json.dumps({"telegram_id": telegram_user_id, "meeting_id": meeting_id})
     state_encoded = base64.urlsafe_b64encode(state_payload.encode()).decode().rstrip("=")
 
-    logger.info(f"🔐 Encoded state: {state_encoded}")
-
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -59,22 +85,18 @@ async def login(request: Request):
     logger.info(f"🔗 Redirecting to: {url}")
     return RedirectResponse(url)
 
+
 @app.get("/callback")
 async def callback(request: Request, code: str = None, state: str = None):
     if not code:
         return HTMLResponse("❌ Authorization failed")
 
     try:
-        logger.info(f"📥 Raw state received: {state}")
         padded_state = state + '=' * (-len(state) % 4)
-        logger.info(f"📥 Padded state: {padded_state}")
         state_json = base64.urlsafe_b64decode(padded_state.encode()).decode()
-        logger.info(f"📥 Decoded state JSON: {state_json}")
         state_data = json.loads(state_json)
         telegram_user_id = state_data["telegram_id"]
         meeting_id = int(state_data["meeting_id"])
-        logger.info(f"✅ Parsed telegram_id: {telegram_user_id}")
-        logger.info(f"✅ Parsed meeting_id: {meeting_id}")
     except Exception as e:
         logger.error(f"⚠️ Invalid state format: {e}")
         return HTMLResponse(f"⚠️ Invalid state format: {e}")
@@ -104,10 +126,9 @@ async def callback(request: Request, code: str = None, state: str = None):
         logger.error(f"❌ Full token response: {token_json}")
         return HTMLResponse(f"❌ Token error: {token_json}")
 
-    db = SessionLocal()
+    db: Session = SessionLocal()
     meeting = db.query(Meeting).filter_by(id=meeting_id).first()
     if not meeting:
-        logger.error(f"❌ Meeting not found for ID: {meeting_id}")
         db.close()
         return HTMLResponse("❌ Meeting not found")
 
@@ -125,20 +146,21 @@ async def callback(request: Request, code: str = None, state: str = None):
         ))
     db.commit()
 
+    # Time extraction logic
+    time_str = meeting.time or extract_time_from_summary(meeting.summary or "")
     try:
         start_dt = datetime.combine(
             meeting.meet_date,
-            datetime.strptime(meeting.time or "10:00", "%H:%M").time()
+            datetime.strptime(time_str, "%H:%M").time()
         )
     except ValueError:
         db.close()
-        logger.error("⚠️ Invalid time format in DB")
-        return HTMLResponse("⚠️ Invalid time format in DB")
+        return HTMLResponse("⚠️ Invalid time format in DB or summary")
 
     end_dt = start_dt + timedelta(hours=1)
 
     calendar_data = {
-        "subject": meeting.activity or "Meeting",
+        "subject": generate_title_from_summary(meeting.summary or "") or meeting.activity or "Meeting",
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Singapore"},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Singapore"},
         "location": {"displayName": meeting.place or "Unknown Location"},
@@ -158,29 +180,11 @@ async def callback(request: Request, code: str = None, state: str = None):
         )
     except Exception as e:
         db.close()
-        logger.error(f"❌ Calendar API error: {e}")
         return HTMLResponse(f"❌ Calendar API error: {e}")
 
     if event_response.status_code == 201:
-        event = event_response.json()
-        logger.info("✅ Event successfully created:")
-        logger.info(f"🆔 ID: {event.get('id')}")
-        logger.info(f"📅 Subject: {event.get('subject')}")
-        logger.info(f"📆 Starts: {event.get('start')}")
-        logger.info(f"📆 Ends: {event.get('end')}")
-        logger.info(f"📍 Location: {event.get('location', {}).get('displayName')}")
-        logger.info(f"📝 Body: {event.get('body', {}).get('content')}")
-
-        test_response = requests.get(
-            "https://graph.microsoft.com/v1.0/me/calendar/events",
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        logger.info("📋 Events fetched from calendar:")
-        logger.info(json.dumps(test_response.json(), indent=2))
-
         db.close()
         return HTMLResponse("✅ Event created and added to your Outlook Calendar.")
     else:
-        logger.error(f"❌ Event creation failed: {event_response.text}")
         db.close()
         return HTMLResponse(f"⚠️ Token saved but event creation failed: {event_response.text}")
