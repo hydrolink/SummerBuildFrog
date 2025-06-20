@@ -508,8 +508,8 @@ async def process_availability(update: Update, chat_id: int):
                     new_lines.append(line)
             summary = "\n".join(new_lines)
 
+
          # Schedule reminder if we have both date and time
-        reminder_time = None
         time_str = extract_time_from_summary(summary)
         if meet_date and time_str:
             meeting_datetime = parse_meeting_datetime(meet_date, time_str)
@@ -518,12 +518,12 @@ async def process_availability(update: Update, chat_id: int):
                 if reminder_time:
                     summary += f"\n\n⏰ **Reminder set for {reminder_time.strftime('%A, %B %d at %I:%M %p')}**"
 
-        # Now save summary *with* the correct reminder string
+                # Save to DB
         db = SessionLocal()
         meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date)
         db.add(meeting)
         db.commit()
-
+        
         sync_link = f"{os.getenv('DOMAIN_BASE_URL')}/login?telegram_id={update.effective_user.id}&meeting_id={meeting.id}"
         final_message = (
             f"📋 Final Summary:\n\n{summary}\n\n"
