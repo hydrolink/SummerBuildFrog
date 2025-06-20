@@ -656,17 +656,17 @@ async def delete_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ Invalid ID. Please provide a number.")
 
-def delete_all_meetings():
-    try:
-        db = SessionLocal()
-        num_deleted = db.query(Meeting).delete()
-        db.commit()
-        db.close()
-        print(f"✅ Deleted {num_deleted} meeting(s) from the database.")
-        return num_deleted
-    except Exception as e:
-        print(f"❌ Failed to delete meetings: {e}")
-        return 0
+async def clear_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    db = SessionLocal()
+    deleted_count = db.query(Meeting).filter(Meeting.chat_id == chat_id).delete()
+    db.commit()
+    db.close()
+
+    if deleted_count > 0:
+        await context.bot.send_message(chat_id=chat_id, text=f"🧹 Cleared {deleted_count} meeting(s) from *this chat*.", parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="ℹ️ No meetings found to delete in this chat.")
 
 # --- STARTUP FUNCTION ---
 async def post_init(application):
@@ -689,7 +689,7 @@ async def main():
     app.add_handler(CommandHandler("deletemeeting", delete_meeting))
     app.add_handler(CommandHandler("editmeeting", start_edit_meeting))
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder))
-    app.add_handler(CommandHandler("clearmeetings", delete_all_meetings))  # ✅ New command
+    app.add_handler(CommandHandler("clearmeetings", clear_meetings))  # ✅ New command
 
     # Passive message tracking
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
