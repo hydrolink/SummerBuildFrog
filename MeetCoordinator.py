@@ -57,31 +57,17 @@ async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int
 def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int) -> datetime:
     try:
         now = datetime.now(pytz.timezone('Asia/Singapore'))
-        delta = meeting_datetime - now
-
-        # Default values
         reminder_time = meeting_datetime - timedelta(hours=12)
         reminder_note = "Your meeting is in 12 hours!"
 
-        if delta <= timedelta(minutes=0):
-            # Meeting is already over or in progress
-            print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
-            return None
-        elif delta <= timedelta(hours=1):
-            # Meeting in less than 1 hour, remind in 5 minutes (or immediately if less than 5)
-            reminder_time = now + timedelta(minutes=5)
-            if (meeting_datetime - reminder_time) < timedelta(minutes=0):
-                reminder_time = now + timedelta(minutes=1)
-            reminder_note = "Your meeting is starting very soon!"
-        elif delta <= timedelta(hours=12):
-            # Meeting is between 1 hour and 12 hours away
-            reminder_time = meeting_datetime - timedelta(hours=1)
-            reminder_note = "Your meeting is in 1 hour!"
-        
-        # Don't schedule reminders in the past
         if reminder_time <= now:
-            print(f"⚠️ Reminder time for meeting {meeting_id} already passed. No reminder scheduled.")
-            return None
+            if meeting_datetime <= now:
+                print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
+                return None
+            else:
+                print(f"⚠️ 12-hour reminder too late for meeting {meeting_id}. Scheduling in 5 minutes.")
+                reminder_time = now + timedelta(minutes=5)
+                reminder_note = "Your meeting is starting soon (in less than 12 hours)!"
 
         scheduler.add_job(
             send_reminder,
@@ -97,6 +83,7 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
     except Exception as e:
         print(f"❌ Failed to schedule reminder for meeting {meeting_id}: {e}")
         return None
+
 
 
 def extract_time_from_summary(summary: str) -> str:
@@ -508,7 +495,6 @@ async def process_availability(update: Update, chat_id: int):
                     new_lines.append(line)
             summary = "\n".join(new_lines)
 
-
          # Schedule reminder if we have both date and time
         time_str = extract_time_from_summary(summary)
         if meet_date and time_str:
@@ -518,7 +504,7 @@ async def process_availability(update: Update, chat_id: int):
                 if reminder_time:
                     summary += f"\n\n⏰ **Reminder set for {reminder_time.strftime('%A, %B %d at %I:%M %p')}**"
 
-                # Save to DB
+        # Save to DB
         db = SessionLocal()
         meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date)
         db.add(meeting)
