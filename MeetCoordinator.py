@@ -57,22 +57,27 @@ async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int
 def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int) -> datetime:
     try:
         now = datetime.now(pytz.timezone('Asia/Singapore'))
-        reminder_time = meeting_datetime - timedelta(hours=12)
-        reminder_note = "Your meeting is in 12 hours!"
+        delta = meeting_datetime - now
 
-        if reminder_time <= now:
-            if meeting_datetime <= now:
-                print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
-                return None
-            else:
-                print(f"⚠️ 12-hour reminder too late for meeting {meeting_id}. Scheduling in 5 minutes.")
-                reminder_time = now + timedelta(minutes=5)
-                reminder_note = "Your meeting is starting soon (in less than 12 hours)!"
+        if delta <= timedelta(minutes=0):
+            print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
+            return None
+
+        if delta > timedelta(hours=12):
+            reminder_time = meeting_datetime - timedelta(hours=12)
+        elif delta > timedelta(hours=1):
+            reminder_time = meeting_datetime - timedelta(hours=1)
+        else:
+            reminder_time = now + timedelta(minutes=5)
+
+        # Prevent reminder being set after the meeting
+        if reminder_time >= meeting_datetime:
+            reminder_time = now + timedelta(minutes=1)
 
         scheduler.add_job(
             send_reminder,
             trigger=DateTrigger(run_date=reminder_time),
-            args=[bot, chat_id, meeting_summary, meeting_id, reminder_note],
+            args=[bot, chat_id, meeting_summary, meeting_id],
             id=f"reminder_{meeting_id}",
             replace_existing=True
         )
@@ -83,8 +88,6 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
     except Exception as e:
         print(f"❌ Failed to schedule reminder for meeting {meeting_id}: {e}")
         return None
-
-
 
 def extract_time_from_summary(summary: str) -> str:
     """Extract time from meeting summary"""
@@ -495,6 +498,12 @@ async def process_availability(update: Update, chat_id: int):
                     new_lines.append(line)
             summary = "\n".join(new_lines)
 
+        # Save to DB
+        db = SessionLocal()
+        meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date)
+        db.add(meeting)
+        db.commit()
+
          # Schedule reminder if we have both date and time
         time_str = extract_time_from_summary(summary)
         if meet_date and time_str:
@@ -504,12 +513,6 @@ async def process_availability(update: Update, chat_id: int):
                 if reminder_time:
                     summary += f"\n\n⏰ **Reminder set for {reminder_time.strftime('%A, %B %d at %I:%M %p')}**"
 
-        # Save to DB
-        db = SessionLocal()
-        meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date)
-        db.add(meeting)
-        db.commit()
-        
         sync_link = f"{os.getenv('DOMAIN_BASE_URL')}/login?telegram_id={update.effective_user.id}&meeting_id={meeting.id}"
         final_message = (
             f"📋 Final Summary:\n\n{summary}\n\n"
