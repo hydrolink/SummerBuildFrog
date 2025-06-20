@@ -54,7 +54,7 @@ async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int
         print(f"❌ Failed to send reminder for meeting {meeting_id}: {e}")
 
 
-def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int):
+def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int) -> datetime:
     try:
         now = datetime.now(pytz.timezone('Asia/Singapore'))
         reminder_time = meeting_datetime - timedelta(hours=12)
@@ -63,7 +63,7 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
         if reminder_time <= now:
             if meeting_datetime <= now:
                 print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
-                return
+                return None
             else:
                 print(f"⚠️ 12-hour reminder too late for meeting {meeting_id}. Scheduling in 5 minutes.")
                 reminder_time = now + timedelta(minutes=5)
@@ -78,9 +78,12 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
         )
 
         print(f"📅 Reminder scheduled for {reminder_time.strftime('%Y-%m-%d %H:%M:%S')} (meeting ID: {meeting_id})")
+        return reminder_time
 
     except Exception as e:
         print(f"❌ Failed to schedule reminder for meeting {meeting_id}: {e}")
+        return None
+
 
 
 def extract_time_from_summary(summary: str) -> str:
@@ -505,8 +508,10 @@ async def process_availability(update: Update, chat_id: int):
             meeting_datetime = parse_meeting_datetime(meet_date, time_str)
             if meeting_datetime:
                 schedule_reminder(update.get_bot(), chat_id, meeting_datetime, summary, meeting.id)
-                reminder_note = f"\n\n⏰ **Reminder set for {(meeting_datetime - timedelta(hours=12)).strftime('%A, %B %d at %I:%M %p')}**"
-                summary += reminder_note
+                reminder_time = schedule_reminder(update.get_bot(), chat_id, meeting_datetime, summary, meeting.id)
+                if reminder_time:
+                    summary += f"\n\n⏰ **Reminder set for {reminder_time.strftime('%A, %B %d at %I:%M %p')}**"
+
 
         sync_link = f"{os.getenv('DOMAIN_BASE_URL')}/login?telegram_id={update.effective_user.id}&meeting_id={meeting.id}"
         final_message = (
