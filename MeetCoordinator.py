@@ -656,6 +656,18 @@ async def delete_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ Invalid ID. Please provide a number.")
 
+def delete_all_meetings():
+    try:
+        db = SessionLocal()
+        num_deleted = db.query(Meeting).delete()
+        db.commit()
+        db.close()
+        print(f"✅ Deleted {num_deleted} meeting(s) from the database.")
+        return num_deleted
+    except Exception as e:
+        print(f"❌ Failed to delete meetings: {e}")
+        return 0
+
 # --- STARTUP FUNCTION ---
 async def post_init(application):
     """Initialize scheduler after the event loop is running"""
@@ -677,6 +689,7 @@ async def main():
     app.add_handler(CommandHandler("deletemeeting", delete_meeting))
     app.add_handler(CommandHandler("editmeeting", start_edit_meeting))
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder))
+    app.add_handler(CommandHandler("clearmeetings", clear_meetings))  # ✅ New command
 
     # Passive message tracking
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
@@ -684,13 +697,13 @@ async def main():
     # Initialize the application and start scheduler
     await app.initialize()
     await post_init(app)
-    
+
     print("✅ Bot is running and ready for group chat...")
-    
+
     # Start polling
     await app.start()
     await app.updater.start_polling()
-    
+
     # Keep the application running
     try:
         await asyncio.Event().wait()
