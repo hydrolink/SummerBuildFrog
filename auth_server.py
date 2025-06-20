@@ -6,7 +6,6 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from db import SessionLocal, OutlookToken, Meeting
-from dateutil import parser
 
 # Load environment variables
 load_dotenv()
@@ -30,27 +29,6 @@ app.add_middleware(SessionMiddleware, secret_key="any-random-secret")
 @app.get("/")
 async def home():
     return HTMLResponse("<a href='/login'>🔗 Connect Outlook Calendar</a>")
-
-
-def generate_title_from_summary(summary: str) -> str:
-    lines = summary.splitlines()
-    for line in lines:
-        if line.strip().startswith("📍 Place:"):
-            return "Meeting at " + line.split("📍 Place:")[1].strip().split(" (")[0]
-    return "Meeting"
-
-def extract_time_from_summary(summary: str) -> str:
-    lines = summary.splitlines()
-    for line in lines:
-        if line.strip().startswith("🕒 Time:"):
-            time_str = line.split("🕒 Time:")[1].strip()
-            try:
-                dt = parser.parse(time_str)
-                return dt.strftime("%H:%M")
-            except:
-                return "10:00"
-    return "10:00"
-
 
 @app.get("/login")
 async def login(request: Request):
