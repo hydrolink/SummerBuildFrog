@@ -55,16 +55,20 @@ async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int
         print(f"❌ Failed to send reminder for meeting {meeting_id}: {e}")
 
 def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int):
-    """Schedule a reminder 12 hours before the meeting"""
+    """Schedule a reminder 12 hours before the meeting or 5 minutes from now if it's too close."""
     try:
-        # Calculate reminder time (12 hours before meeting)
+        now = datetime.now(pytz.timezone('Asia/Singapore'))
         reminder_time = meeting_datetime - timedelta(hours=12)
-        
-        # Don't schedule if reminder time is in the past
-        if reminder_time <= datetime.now(pytz.timezone('Asia/Singapore')):
-            print(f"⚠️ Reminder time for meeting {meeting_id} is in the past, skipping")
-            return
-        
+
+        # If too late to schedule 12h reminder, fallback to 5 minutes from now if meeting is still upcoming
+        if reminder_time <= now:
+            if meeting_datetime <= now:
+                print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
+                return
+            else:
+                print(f"⚠️ 12-hour reminder too late for meeting {meeting_id}. Scheduling in 5 minutes.")
+                reminder_time = now + timedelta(minutes=5)
+
         # Schedule the reminder
         scheduler.add_job(
             send_reminder,
@@ -73,9 +77,9 @@ def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_sum
             id=f"reminder_{meeting_id}",
             replace_existing=True
         )
-        
-        print(f"📅 Reminder scheduled for {reminder_time} (meeting ID: {meeting_id})")
-        
+
+        print(f"📅 Reminder scheduled for {reminder_time.strftime('%Y-%m-%d %H:%M:%S')} (meeting ID: {meeting_id})")
+
     except Exception as e:
         print(f"❌ Failed to schedule reminder for meeting {meeting_id}: {e}")
 
