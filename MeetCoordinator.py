@@ -484,7 +484,7 @@ async def find_nearest_bus_stop(location_name):
 
 # --- PROCESSING WITH GPT ---
 
-async def process_availability(update: Update, chat_id: int):
+async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     group_data = listening_sessions.get(chat_id, {})
     if not group_data:
         await update.message.reply_text("❌ No messages were collected.")
@@ -583,7 +583,8 @@ async def process_availability(update: Update, chat_id: int):
             f"🔗 [🗓️ Click here to add to Outlook Calendar]({sync_link})"
         )
 
-        await update.message.reply_text(final_message, parse_mode="Markdown", disable_web_page_preview=True)
+        await send_final_summary_with_buttons(context, chat_id, final_message)
+
 
 
     except Exception as e:
@@ -754,6 +755,8 @@ async def main():
     app.add_handler(CommandHandler("editmeeting", start_edit_meeting))
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder))
     app.add_handler(CommandHandler("clearmeetings", clear_meetings))  # ✅ New command
+    app.add_handler(CallbackQueryHandler(meeting_button_handler))
+
 
     # Passive message tracking
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
