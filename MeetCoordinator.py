@@ -311,13 +311,13 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
     return None
 
 # Making Buttons 
-async def send_final_summary_with_buttons(context, chat_id, summary_text):
-    # Define the inline buttons
+async def send_final_summary_with_buttons(context, chat_id, summary_text, meeting_id: int):
     buttons = [
-        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data='delete')],
-        [InlineKeyboardButton("✏️ Edit Meeting", callback_data='edit')],
+        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete:{meeting_id}')],
+        [InlineKeyboardButton("✏️ Edit Meeting", callback_data=f'edit:{meeting_id}')],
         [InlineKeyboardButton("📍 Choose Type of Meetup", callback_data='choose_type')]
     ]
+
     reply_markup = InlineKeyboardMarkup(buttons)
 
     # Send the final summary with inline buttons
@@ -327,31 +327,24 @@ async def send_final_summary_with_buttons(context, chat_id, summary_text):
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
+
 async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data.startswith("delete:"):
-        meeting_id = data.split(":")[1]
-        context.args = [meeting_id]
-
-        # Create a fake message object so `update.message` exists
-        update.message = query.message
-        await delete_meeting(update, context)
-
-        # Edit the original inline message after deletion
-        try:
+        meeting_id = int(data.split(":")[1])
+        success = await perform_meeting_deletion(update.effective_chat.id, meeting_id, context)
+        if success:
             await query.edit_message_text("✅ Meeting deleted.")
-        except:
-            pass
+        else:
+            await query.edit_message_text("❌ Meeting not found.")
 
     elif data.startswith("edit:"):
-        meeting_id = data.split(":")[1]
-        context.args = [meeting_id]
+        meeting_id = int(data.split(":")[1])
+        await perform_edit_start(update.effective_user.id, update.effective_chat.id, meeting_id, context)
 
-        update.message = query.message
-        await start_edit_meeting(update, context)
 
     elif data == "choose_type":
         type_keyboard = [
@@ -471,9 +464,6 @@ async def find_nearest_bus_stop(location_name):
         print(f"Bus stop error: {e}")
         return "❌ Error occurred during bus stop search."
 
-
-
-
 # --- PROCESSING WITH GPT ---
 
 async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -575,8 +565,7 @@ async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🔗 [🗓️ Click here to add to Outlook Calendar]({sync_link})"
         )
 
-        await send_final_summary_with_buttons(context, chat_id, final_message)
-
+        await send_final_summary_with_buttons(context, chat_id, final_message, meeting.id)
 
 
     except Exception as e:
@@ -639,6 +628,27 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def perform_edit_start(user_id, chat_id, meeting_id, context):
+    db = SessionLocal()
+    meeting = db.query(Meeting).filter_by(id=meeting_id, chat_id=chat_id).first()
+    if not meeting:
+        return False
+
+    editing_sessions[user_id] = {
+        'step': 'choose_field',
+        'meeting_id': meeting_id
+    }
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📋 You're editing Meeting ID: {meeting_id}\n\n"
+             "Which field do you want to update?\n"
+             "`date`, `time`, `place`, `pax`, or `activity`",
+        parse_mode="Markdown"
+    )
+    return True
+
+
 async def start_edit_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
@@ -647,29 +657,10 @@ async def start_edit_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         meeting_id = int(args[0])
-        await initiate_edit_flow(update, context, meeting_id)
+        await perform_edit_start(update.effective_user.id, update.effective_chat.id, meeting_id, context)
     except ValueError:
         await update.message.reply_text("⚠️ Invalid meeting ID.")
 
-async def initiate_edit_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, meeting_id: int):
-    db = SessionLocal()
-    meeting = db.query(Meeting).filter_by(id=meeting_id).first()
-    if not meeting:
-        await update.effective_chat.send_message("❌ Meeting not found.")
-        return
-
-    user_id = update.effective_user.id
-    editing_sessions[user_id] = {
-        'step': 'choose_field',
-        'meeting_id': meeting_id
-    }
-
-    await update.effective_chat.send_message(
-        f"📋 You're editing Meeting ID: {meeting_id}\n\n"
-        "Which field do you want to update?\n"
-        "`date`, `time`, `place`, `pax`, or `activity`",
-        parse_mode="Markdown"
-    )
 
 
 async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -694,6 +685,15 @@ async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error cancelling reminder: {e}")
 
+async def perform_meeting_deletion(chat_id, meeting_id, context):
+    db = SessionLocal()
+    meeting = db.query(Meeting).filter_by(id=meeting_id, chat_id=chat_id).first()
+    if meeting:
+        db.delete(meeting)
+        db.commit()
+        return True
+    return False
+
 
 async def delete_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -703,17 +703,14 @@ async def delete_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         meeting_id = int(args[0])
-        db = SessionLocal()
-        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
-
-        if meeting:
-            db.delete(meeting)
-            db.commit()
+        success = await perform_meeting_deletion(update.effective_chat.id, meeting_id, context)
+        if success:
             await update.message.reply_text("🗑️ Meeting deleted.")
         else:
             await update.message.reply_text("❌ Meeting not found.")
     except ValueError:
         await update.message.reply_text("⚠️ Invalid ID. Please provide a number.")
+
 
 async def clear_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
