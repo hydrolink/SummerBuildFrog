@@ -182,7 +182,7 @@ async def stop_listening(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("✅ Stopped listening. Processing availability now...")
-    await process_availability(update, chat_id)
+    await process_availability(update, context, chat_id)
     del listening_sessions[chat_id]  # Clear after processing
 
 
