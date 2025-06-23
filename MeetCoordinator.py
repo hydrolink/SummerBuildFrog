@@ -13,6 +13,8 @@ import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler # pip install apscheduler pytz
 from apscheduler.triggers.date import DateTrigger
 import pytz
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
 editing_sessions = {}
 
@@ -307,6 +309,68 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
                 return parsed_date.date()
             break  # stop after the first valid 📅 Date
     return None
+
+# Making Buttons 
+async def send_final_summary_with_buttons(context, chat_id, summary_text):
+    # Define the inline buttons
+    buttons = [
+        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data='delete')],
+        [InlineKeyboardButton("✏️ Edit Meeting", callback_data='edit')],
+        [InlineKeyboardButton("📍 Choose Type of Meetup", callback_data='choose_type')]
+    ]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    # Send the final summary with inline buttons
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=summary_text,
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "delete":
+        await query.edit_message_text("✅ Meeting deleted.")
+    elif query.data == "edit":
+        await query.edit_message_text("✏️ You can now edit your meeting.")
+    elif query.data == "choose_type":
+        type_keyboard = [
+            [InlineKeyboardButton("💬 Casual", callback_data='type_casual')],
+            [InlineKeyboardButton("💼 Work", callback_data='type_work')],
+            [InlineKeyboardButton("💻 Online", callback_data='type_online')]
+        ]
+        await query.edit_message_text("Select a meeting type:", reply_markup=InlineKeyboardMarkup(type_keyboard))
+    elif query.data.startswith("type_"):
+        selected = query.data.split("_")[1].capitalize()
+        await query.edit_message_text(f"✅ You selected *{selected}* meeting.", parse_mode="Markdown")
+
+
+# CallbackQueryHandler for the buttons
+async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "delete":
+        await query.edit_message_text("✅ Meeting deleted.")
+        # Add your deletion logic here
+    elif query.data == "edit":
+        await query.edit_message_text("✏️ You can now edit your meeting.")
+        # Add your edit logic here
+    elif query.data == "choose_type":
+        type_keyboard = [
+            [InlineKeyboardButton("💬 Casual", callback_data='type_casual')],
+            [InlineKeyboardButton("💼 Work", callback_data='type_work')],
+            [InlineKeyboardButton("💻 Online", callback_data='type_online')]
+        ]
+        await query.edit_message_text("Select a meeting type:", reply_markup=InlineKeyboardMarkup(type_keyboard))
+    elif query.data.startswith("type_"):
+        selected_type = query.data.split("_")[1].capitalize()
+        await query.edit_message_text(f"✅ You selected *{selected_type}* meeting.", parse_mode="Markdown")
+
+
+
 
 # --- GOOGLE MAPS ---
 async def get_nearest_mrt(place):
