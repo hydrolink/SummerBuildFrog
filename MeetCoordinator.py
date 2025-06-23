@@ -330,46 +330,29 @@ async def send_final_summary_with_buttons(context, chat_id, summary_text):
 async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    if query.data == "delete":
-        await query.edit_message_text("✅ Meeting deleted.")
-    elif query.data == "edit":
-        await query.edit_message_text("✏️ You can now edit your meeting.")
-    elif query.data == "choose_type":
-        type_keyboard = [
-            [InlineKeyboardButton("💬 Casual", callback_data='type_casual')],
-            [InlineKeyboardButton("💼 Work", callback_data='type_work')],
-            [InlineKeyboardButton("💻 Online", callback_data='type_online')]
-        ]
-        await query.edit_message_text("Select a meeting type:", reply_markup=InlineKeyboardMarkup(type_keyboard))
-    elif query.data.startswith("type_"):
-        selected = query.data.split("_")[1].capitalize()
-        await query.edit_message_text(f"✅ You selected *{selected}* meeting.", parse_mode="Markdown")
-
-
-# CallbackQueryHandler for the buttons
-async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
     data = query.data
 
-    # Handle "delete:<id>" and "edit:<id>"
     if data.startswith("delete:"):
-        meeting_id = int(data.split(":")[1])
-        db = SessionLocal()
-        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
-        if meeting:
-            db.delete(meeting)
-            db.commit()
+        meeting_id = data.split(":")[1]
+        context.args = [meeting_id]
+
+        # Create a fake message object so `update.message` exists
+        update.message = query.message
+        await delete_meeting(update, context)
+
+        # Edit the original inline message after deletion
+        try:
             await query.edit_message_text("✅ Meeting deleted.")
-        else:
-            await query.edit_message_text("❌ Meeting not found.")
+        except:
+            pass
 
     elif data.startswith("edit:"):
-        meeting_id = int(data.split(":")[1])
-        await initiate_edit_flow(update, context, meeting_id)
+        meeting_id = data.split(":")[1]
+        context.args = [meeting_id]
 
-    # Existing flow for choosing meeting type
+        update.message = query.message
+        await start_edit_meeting(update, context)
+
     elif data == "choose_type":
         type_keyboard = [
             [InlineKeyboardButton("💬 Casual", callback_data='type_casual')],
@@ -381,7 +364,6 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("type_"):
         selected_type = data.split("_")[1].capitalize()
         await query.edit_message_text(f"✅ You selected *{selected_type}* meeting.", parse_mode="Markdown")
-
 # --- GOOGLE MAPS ---
 async def get_nearest_mrt(place):
     try:
