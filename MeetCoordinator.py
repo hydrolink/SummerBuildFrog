@@ -351,26 +351,36 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
 async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
 
-    if query.data == "delete":
-        await query.edit_message_text("✅ Meeting deleted.")
-        # Add your deletion logic here
-    elif query.data == "edit":
-        await query.edit_message_text("✏️ You can now edit your meeting.")
-        # Add your edit logic here
-    elif query.data == "choose_type":
+    # Handle "delete:<id>" and "edit:<id>"
+    if data.startswith("delete:"):
+        meeting_id = int(data.split(":")[1])
+        db = SessionLocal()
+        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+        if meeting:
+            db.delete(meeting)
+            db.commit()
+            await query.edit_message_text("✅ Meeting deleted.")
+        else:
+            await query.edit_message_text("❌ Meeting not found.")
+
+    elif data.startswith("edit:"):
+        meeting_id = int(data.split(":")[1])
+        await initiate_edit_flow(update, context, meeting_id)
+
+    # Existing flow for choosing meeting type
+    elif data == "choose_type":
         type_keyboard = [
             [InlineKeyboardButton("💬 Casual", callback_data='type_casual')],
             [InlineKeyboardButton("💼 Work", callback_data='type_work')],
             [InlineKeyboardButton("💻 Online", callback_data='type_online')]
         ]
         await query.edit_message_text("Select a meeting type:", reply_markup=InlineKeyboardMarkup(type_keyboard))
-    elif query.data.startswith("type_"):
-        selected_type = query.data.split("_")[1].capitalize()
+
+    elif data.startswith("type_"):
+        selected_type = data.split("_")[1].capitalize()
         await query.edit_message_text(f"✅ You selected *{selected_type}* meeting.", parse_mode="Markdown")
-
-
-
 
 # --- GOOGLE MAPS ---
 async def get_nearest_mrt(place):
@@ -655,27 +665,29 @@ async def start_edit_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         meeting_id = int(args[0])
-        db = SessionLocal()
-        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
-        if not meeting:
-            await update.message.reply_text("❌ Meeting not found.")
-            return
-
-        user_id = update.effective_user.id
-        editing_sessions[user_id] = {
-            'step': 'choose_field',
-            'meeting_id': meeting_id
-        }
-
-        await update.message.reply_text(
-            f"📋 You're editing Meeting ID: {meeting_id}\n\n"
-            "Which field do you want to update?\n"
-            "`date`, `time`, `place`, `pax`, or `activity`",
-            parse_mode="Markdown"
-        )
-
+        await initiate_edit_flow(update, context, meeting_id)
     except ValueError:
         await update.message.reply_text("⚠️ Invalid meeting ID.")
+
+async def initiate_edit_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, meeting_id: int):
+    db = SessionLocal()
+    meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+    if not meeting:
+        await update.effective_chat.send_message("❌ Meeting not found.")
+        return
+
+    user_id = update.effective_user.id
+    editing_sessions[user_id] = {
+        'step': 'choose_field',
+        'meeting_id': meeting_id
+    }
+
+    await update.effective_chat.send_message(
+        f"📋 You're editing Meeting ID: {meeting_id}\n\n"
+        "Which field do you want to update?\n"
+        "`date`, `time`, `place`, `pax`, or `activity`",
+        parse_mode="Markdown"
+    )
 
 
 async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
