@@ -23,3 +23,13 @@ gunicorn>=21.2.0
 # Scheduling and Timezone Support
 apscheduler>=3.10.0
 pytz>=2023.3
+
+# Whisper Voice Transcription
+aiohttp>=3.9.0
+
+# ICS Calendar File Generation
+ics>=0.7.2
+
+# External dependency (install via system):
+# ffmpeg must be installed on your machine/server
+# e.g. sudo apt install ffmpeg OR brew install ffmpeg

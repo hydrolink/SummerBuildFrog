@@ -1,7 +1,7 @@
 import os
 from db import SessionLocal, Meeting
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ChatMemberHandler
 from openai import OpenAI
 from datetime import datetime, date, timedelta
@@ -12,9 +12,15 @@ from urllib.parse import quote
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler # pip install apscheduler pytz
 from apscheduler.triggers.date import DateTrigger
+from ics import Calendar, Event as IcsEvent
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import aiohttp
+import tempfile
+import subprocess
+import uuid
+from io import BytesIO
 
 editing_sessions = {}
 
@@ -200,9 +206,16 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         db = SessionLocal()
         meeting = db.query(Meeting).filter_by(id=session['meeting_id']).first()
 
+        if not meeting:
+            del editing_sessions[user_id]
+            await update.message.reply_text("❌ Meeting not found (may have been deleted). Edit cancelled.")
+            return
+
+
         if step == 'choose_field':
             if text.lower() not in ['date', 'time', 'place', 'pax', 'activity']:
-                await update.message.reply_text("❌ Invalid field. Please choose from `date`, `time`, `place`, `pax`, or `activity`.")
+                await update.message.reply_text("❌ Invalid field. Please choose a valid option below.")
+                await perform_edit_start(user_id, chat_id, session['meeting_id'], context)
                 return
             session['field'] = text.lower()
             session['step'] = 'enter_value'
@@ -221,8 +234,25 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 else:
                     updated_lines.append(line)
 
+            # Validation for 'date' or 'time' field
+            if field == 'date':
+                parsed_date = dateparser.parse(text)
+                if not parsed_date or parsed_date.date() < date.today():
+                    await update.message.reply_text("❌ Invalid date. Please enter a future date like `next Friday` or `July 10`.")
+                    return
+
+                meeting.meet_date = parsed_date.date()
+
+            elif field == 'time':
+                parsed_time = dateparser.parse(text)
+                if not parsed_time:
+                    await update.message.reply_text("❌ Invalid time. Please enter something like `7pm`, `19:30`, or `8:15am`.")
+                    return
+
+            # Update summary
             meeting.summary = '\n'.join(updated_lines)
             db.commit()
+
 
              # If date or time was updated, reschedule reminder
             if field in ['date', 'time']:
@@ -240,7 +270,16 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         schedule_reminder(context.bot, chat_id, meeting_datetime, meeting.summary, meeting.id)
             
             del editing_sessions[user_id]
-            await update.message.reply_text("✅ Meeting updated successfully!")
+            buttons = [
+                [InlineKeyboardButton("✏️ Edit More", callback_data=f"edit:{meeting.id}")],
+                [InlineKeyboardButton("👁️ View Summary", callback_data=f"view:{meeting.id}")]
+            ]
+
+            await update.message.reply_text(
+                "✅ Meeting updated successfully!",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
             return
 
     # --- Listening mode ---
@@ -311,22 +350,46 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
     return None
 
 # Making Buttons 
+from telegram import InputFile
+
 async def send_final_summary_with_buttons(context, chat_id, summary_text, meeting_id: int):
+    # Parse for .ics fields
+    db = SessionLocal()
+    meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+    time_str = extract_time_from_summary(meeting.summary)
+    meeting_datetime = parse_meeting_datetime(meeting.meet_date, time_str)
+
+    # Create .ics file if possible
+    ics_buf = None
+    if meeting_datetime:
+        ics_buf = create_ics_file(
+            meeting_title="Group Meeting",
+            description=meeting.summary,
+            start_time=meeting_datetime
+        )
+
+
     buttons = [
-        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete:{meeting_id}')],
         [InlineKeyboardButton("✏️ Edit Meeting", callback_data=f'edit:{meeting_id}')],
-        [InlineKeyboardButton("📍 Choose Type of Meetup", callback_data='choose_type')]
+        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete:{meeting_id}')],
     ]
 
-    reply_markup = InlineKeyboardMarkup(buttons)
-
-    # Send the final summary with inline buttons
     await context.bot.send_message(
         chat_id=chat_id,
         text=summary_text,
         parse_mode="Markdown",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
+
+    if ics_buf:
+        # ics_buf is a BytesIO with .name == "meeting.ics"
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=InputFile(ics_buf, filename=ics_buf.name),
+            caption="📅 Tap to add this meeting to your calendar!"
+        )
+
+
 
 async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -345,18 +408,34 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
         meeting_id = int(data.split(":")[1])
         await perform_edit_start(update.effective_user.id, update.effective_chat.id, meeting_id, context)
 
+    elif data.startswith("editfield:"):
+        parts = data.split(":")
+        meeting_id = int(parts[1])
+        field = parts[2]
+        user_id = update.effective_user.id
+        editing_sessions[user_id] = {
+            'step': 'enter_value',
+            'meeting_id': meeting_id,
+            'field': field
+        }
 
-    elif data == "choose_type":
-        type_keyboard = [
-            [InlineKeyboardButton("💬 Casual", callback_data='type_casual')],
-            [InlineKeyboardButton("💼 Work", callback_data='type_work')],
-            [InlineKeyboardButton("💻 Online", callback_data='type_online')]
-        ]
-        await query.edit_message_text("Select a meeting type:", reply_markup=InlineKeyboardMarkup(type_keyboard))
+        field_name = field.capitalize()
+        await query.edit_message_text(
+            f"✏️ Please enter the new value for *{field_name}*:",
+            parse_mode="Markdown"
+        )
 
-    elif data.startswith("type_"):
-        selected_type = data.split("_")[1].capitalize()
-        await query.edit_message_text(f"✅ You selected *{selected_type}* meeting.", parse_mode="Markdown")
+
+    elif data.startswith("view:"):
+        meeting_id = int(data.split(":")[1])
+        db = SessionLocal()
+        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+        if meeting:
+            await query.edit_message_text(meeting.summary, parse_mode="Markdown")
+        else:
+            await query.edit_message_text("❌ Meeting not found.")
+
+
 # --- GOOGLE MAPS ---
 async def get_nearest_mrt(place):
     try:
@@ -463,6 +542,68 @@ async def find_nearest_bus_stop(location_name):
     except Exception as e:
         print(f"Bus stop error: {e}")
         return "❌ Error occurred during bus stop search."
+    
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    voice = update.message.voice
+    user = update.message.from_user.full_name
+    chat_id = update.effective_chat.id
+    file = await context.bot.get_file(voice.file_id)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as ogg_file:
+        await file.download_to_drive(ogg_file.name)
+        ogg_path = ogg_file.name
+
+    # Convert to mp3 using ffmpeg
+    mp3_path = ogg_path.replace(".ogg", ".mp3")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", mp3_path], check=True)
+    except Exception as e:
+        await update.message.reply_text("❌ Audio conversion failed.")
+        print("FFmpeg error:", e)
+        return
+
+    # Transcribe with OpenAI Whisper
+    transcription = await transcribe_with_whisper(mp3_path)
+
+    if transcription:
+        await update.message.reply_text(f"📝 *Transcription from {user}:*\n\n{transcription}", parse_mode="Markdown")
+
+        # Append to listening session
+        if chat_id not in listening_sessions:
+            listening_sessions[chat_id] = {}
+        if user not in listening_sessions[chat_id]:
+            listening_sessions[chat_id][user] = []
+        listening_sessions[chat_id][user].append(f"[voice] {transcription}")
+    else:
+        await update.message.reply_text("❌ Failed to transcribe voice message.")
+
+async def transcribe_with_whisper(audio_file_path):
+    try:
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        url = "https://api.openai.com/v1/audio/transcriptions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            with open(audio_file_path, 'rb') as f:
+                form = aiohttp.FormData()
+                form.add_field("file", f, filename="audio.mp3", content_type="audio/mpeg")
+                form.add_field("model", "whisper-1")
+                form.add_field("language", "en")  # Force English transcription
+
+                async with session.post(url, headers=headers, data=form) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        return result.get("text")
+                    else:
+                        print("Whisper API failed:", await resp.text())
+                        return None
+    except Exception as e:
+        print("Whisper transcription error:", e)
+        return None
+
+
 
 # --- PROCESSING WITH GPT ---
 
@@ -572,6 +713,48 @@ async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYP
         error_msg = getattr(e, 'response', str(e))
         await update.message.reply_text(f"❌ Error processing with GPT:\n{error_msg}")
 
+def escape_ics_text(text: str) -> str:
+    """
+    Escapes characters according to RFC 5545 so that calendar apps can parse it correctly.
+    """
+    return (
+        text.replace('\\', '\\\\')  # Escape backslash
+            .replace('\n', '\\n')   # Escape newlines
+            .replace(',', '\\,')    # Escape commas
+            .replace(';', '\\;')    # Escape semicolons
+    )
+
+def create_ics_file(meeting_title: str,
+                    description: str,
+                    start_time: datetime,
+                    duration_minutes: int = 60) -> BytesIO:
+    """
+    Builds an .ics file in memory and returns it as a BytesIO buffer
+    named 'meeting.ics', ready to send as an attachment.
+    """
+    # 1) Ensure tz-aware
+    if start_time.tzinfo is None:
+        start_time = pytz.timezone("Asia/Singapore").localize(start_time)
+
+    # 2) Build Calendar + Event
+    cal = Calendar()
+    ev = IcsEvent()
+    ev.name        = meeting_title.strip()
+    ev.begin       = start_time
+    ev.duration    = timedelta(minutes=duration_minutes)
+    ev.description = description
+    ev.uid         = f"{uuid.uuid4()}@meetcoord.local"
+    ev.created     = datetime.utcnow().replace(tzinfo=pytz.utc)
+
+    cal.events.add(ev)
+
+    # 3) Serialize to bytes and wrap in BytesIO
+    ics_bytes = cal.serialize().encode("utf-8")
+    buf = BytesIO(ics_bytes)
+    buf.name = "meeting.ics"  # Telegram will use this as filename
+    buf.seek(0)
+    return buf
+
 
 
 async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,50 +766,31 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 No saved meetings found.")
         return
 
-    reply = "🗂️ *Saved Meetings:*\n\n"
-
     for m in meetings:
-        date_str = m.meet_date.strftime('%A, %B %d, %Y') if m.meet_date else "Unknown"
-        created_str = m.created_at.strftime('%Y-%m-%d %H:%M')
+        date_str = m.meet_date.strftime('%b %d') if m.meet_date else "?"
+        time_str = "?"  # Extract from summary
+        place_str = "?"
 
-        # Convert escaped \n into actual line breaks
-        clean_summary = m.summary.replace("\\n", "\n")
+        for line in m.summary.splitlines():
+            if line.strip().startswith("🕒 Time:"):
+                time_str = line.split("🕒 Time:")[1].strip()
+            elif line.strip().startswith("📍 Place:"):
+                place_str = line.split("📍 Place:")[1].strip()
 
-        # Extract fields from cleaned summary
-        details = {
-            "📅 Date": "Not found",
-            "🕒 Time": "Not found",
-            "📍 Place": "Not found",
-            "🚇 Nearest MRT": "Not found",
-            "👥 Pax": "Not found",
-            "🎯 Activity": "Not found"
-        }
+        text = f"🆔 *ID {m.id}* | 📅 *{date_str}* | 🕒 *{time_str}* | 📍 *{place_str}*"
+        buttons = [
+            [
+                InlineKeyboardButton("👁️ View", callback_data=f"view:{m.id}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{m.id}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{m.id}")
+            ]
+        ]
 
-        for line in clean_summary.splitlines():
-            for key in details:
-                if line.strip().startswith(key):
-                    details[key] = line[len(key)+1:].strip()
-
-        # Check if reminder is scheduled
-        reminder_status = "⏰ Active" if scheduler.get_job(f"reminder_{m.id}") else "❌ None"
-
-        reply += (
-            f"🆔 *ID:* `{m.id}`\n"
-            f"📌 *Created:* {created_str}\n"
-            f"📅 *Date:* {details['📅 Date']}\n"
-            f"🕒 *Time:* {details['🕒 Time']}\n"
-            f"📍 *Place:* {details['📍 Place']}\n"
-            f"🚇 *MRT:* {details['🚇 Nearest MRT']}\n"
-            f"👥 *Pax:* {details['👥 Pax']}\n"
-            f"🎯 *Activity:* {details['🎯 Activity']}\n"
-            f"⏰ *Reminder:* {reminder_status}\n"
-            "───────────────\n"
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
         )
-
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-
-
 
 async def perform_edit_start(user_id, chat_id, meeting_id, context):
     db = SessionLocal()
@@ -639,13 +803,28 @@ async def perform_edit_start(user_id, chat_id, meeting_id, context):
         'meeting_id': meeting_id
     }
 
+    buttons = [
+        [
+            InlineKeyboardButton("📅 Date", callback_data=f"editfield:{meeting_id}:date"),
+            InlineKeyboardButton("🕒 Time", callback_data=f"editfield:{meeting_id}:time")
+        ],
+        [
+            InlineKeyboardButton("📍 Place", callback_data=f"editfield:{meeting_id}:place"),
+            InlineKeyboardButton("👥 Pax", callback_data=f"editfield:{meeting_id}:pax")
+        ],
+        [
+            InlineKeyboardButton("🎯 Activity", callback_data=f"editfield:{meeting_id}:activity")
+        ]
+    ]
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"📋 You're editing Meeting ID: {meeting_id}\n\n"
-             "Which field do you want to update?\n"
-             "`date`, `time`, `place`, `pax`, or `activity`",
+        text=f"📋 You're editing *Meeting ID: {meeting_id}*\n\n"
+            "Which field do you want to update?",
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
+
     return True
 
 
@@ -747,7 +926,7 @@ async def main():
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder))
     app.add_handler(CommandHandler("clearmeetings", clear_meetings))  # ✅ New command
     app.add_handler(CallbackQueryHandler(meeting_button_handler))
-
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
     # Passive message tracking
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
