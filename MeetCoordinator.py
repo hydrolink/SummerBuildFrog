@@ -2,7 +2,7 @@ import os
 from db import SessionLocal, Meeting
 from dotenv import load_dotenv
 from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ChatMemberHandler
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ChatMemberHandler, CallbackQueryHandler
 from openai import OpenAI
 from datetime import datetime, date, timedelta, timezone
 import re
@@ -10,12 +10,11 @@ import dateparser
 import googlemaps
 from urllib.parse import quote
 import asyncio
-from apscheduler.schedulers.asyncio import AsyncIOScheduler # pip install apscheduler pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from ics import Calendar, Event as IcsEvent
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 import aiohttp
 import tempfile
 import subprocess
@@ -23,6 +22,8 @@ import uuid
 from io import BytesIO
 
 editing_sessions = {}
+
+
 
 # Load environment variables
 load_dotenv()
@@ -35,67 +36,11 @@ gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 # States per group
 listening_sessions = {}  # {chat_id: {user: [messages]}}
 
-# Initialize scheduler but don't start it yet
-scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Singapore'))
+scheduler = AsyncIOScheduler(timezone="Asia/Singapore")
 
 def escape_markdown_v2(text: str) -> str:
     escape_chars = r"\_*[]()~`>#+-=|{}.!"
     return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
-
-async def send_reminder(bot, chat_id: int, meeting_summary: str, meeting_id: int, reminder_time_note: str = "Your meeting is in 12 hours!"):
-    try:
-        reminder_message = (
-            "⏰ **MEETING REMINDER** ⏰\n\n"
-            f"{reminder_time_note}\n\n"
-            f"📋 **Meeting Details:**\n{meeting_summary}\n\n"
-        )
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text=reminder_message,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-        print(f"✅ Reminder sent for meeting ID {meeting_id} to chat {chat_id}")
-
-    except Exception as e:
-        print(f"❌ Failed to send reminder for meeting {meeting_id}: {e}")
-
-
-def schedule_reminder(bot, chat_id: int, meeting_datetime: datetime, meeting_summary: str, meeting_id: int) -> datetime:
-    try:
-        now = datetime.now(pytz.timezone('Asia/Singapore'))
-        delta = meeting_datetime - now
-
-        if delta <= timedelta(minutes=0):
-            print(f"⚠️ Meeting {meeting_id} is already over or in progress. No reminder scheduled.")
-            return None
-
-        if delta > timedelta(hours=12):
-            reminder_time = meeting_datetime - timedelta(hours=12)
-        elif delta > timedelta(hours=1):
-            reminder_time = meeting_datetime - timedelta(hours=1)
-        else:
-            reminder_time = now + timedelta(minutes=5)
-
-        # Prevent reminder being set after the meeting
-        if reminder_time >= meeting_datetime:
-            reminder_time = now + timedelta(minutes=1)
-
-        scheduler.add_job(
-            send_reminder,
-            trigger=DateTrigger(run_date=reminder_time),
-            args=[bot, chat_id, meeting_summary, meeting_id],
-            id=f"reminder_{meeting_id}",
-            replace_existing=True
-        )
-
-        print(f"📅 Reminder scheduled for {reminder_time.strftime('%Y-%m-%d %H:%M:%S')} (meeting ID: {meeting_id})")
-        return reminder_time
-
-    except Exception as e:
-        print(f"❌ Failed to schedule reminder for meeting {meeting_id}: {e}")
-        return None
 
 def extract_time_from_summary(summary: str) -> str:
     """Extract time from meeting summary"""
@@ -251,24 +196,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
             # Update summary
             meeting.summary = '\n'.join(updated_lines)
-            db.commit()
-
-
-             # If date or time was updated, reschedule reminder
-            if field in ['date', 'time']:
-                try:
-                    # Cancel old reminder
-                    scheduler.remove_job(f"reminder_{meeting.id}")
-                except:
-                    pass
-                
-                # Schedule new reminder if possible
-                time_str = extract_time_from_summary(meeting.summary)
-                if meeting.meet_date and time_str:
-                    meeting_datetime = parse_meeting_datetime(meeting.meet_date, time_str)
-                    if meeting_datetime:
-                        schedule_reminder(context.bot, chat_id, meeting_datetime, meeting.summary, meeting.id)
-            
+            db.commit()    
             del editing_sessions[user_id]
             buttons = [
                 [InlineKeyboardButton("✏️ Edit More", callback_data=f"edit:{meeting.id}")],
@@ -372,8 +300,8 @@ async def send_final_summary_with_buttons(context, chat_id, summary_text, meetin
     buttons = [
         [InlineKeyboardButton("✏️ Edit Meeting", callback_data=f'edit:{meeting_id}')],
         [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete:{meeting_id}')],
+        [InlineKeyboardButton("⏰ Set Reminder", callback_data=f'setreminder:{meeting_id}')]
     ]
-
     await context.bot.send_message(
         chat_id=chat_id,
         text=summary_text,
@@ -435,6 +363,89 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.edit_message_text("❌ Meeting not found.")
 
+    elif data.startswith("setreminder:"):
+        meeting_id = int(data.split(":",1)[1])
+        await offer_reminder_presets(query, context, meeting_id)
+
+    elif data.startswith("remind:"):
+        # pattern remind:<meeting_id>:<minutes>
+        _, mid, mins = data.split(":")
+        await schedule_reminder(query, context, int(mid), int(mins))
+
+    elif data.startswith("remindcustom:"):
+        meeting_id = int(data.split(":",1)[1])
+        # ask user to type e.g. "90m" or "2h30m"
+        await query.edit_message_text(
+            "✏️ Please enter a custom reminder interval (e.g. `90m` or `2h30m`):",
+            parse_mode="Markdown"
+        )
+        # store state so the next text message from this user is parsed as a custom interval
+        context.user_data["awaiting_custom_reminder_for"] = meeting_id
+
+# --- helper to show preset buttons ---
+async def offer_reminder_presets(query, context, meeting_id):
+    presets = [("1 h before", 60), ("3 h", 180), ("6 h", 360), ("12 h", 720), ("24 h", 1440)]
+    kb = [
+        [InlineKeyboardButton(label, callback_data=f"remind:{meeting_id}:{mins}")]
+        for label, mins in presets
+    ] + [[InlineKeyboardButton("🔧 Custom…", callback_data=f"remindcustom:{meeting_id}")]]
+    await query.edit_message_text(
+        "⏰ When would you like to be reminded?",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+# --- helper to schedule the reminder job ---
+async def schedule_reminder(query, context, meeting_id: int, minutes_before: int):
+    db = SessionLocal()
+    meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+    if not meeting or not meeting.meet_date:
+        return await query.answer("❌ Missing meeting date.", show_alert=True)
+
+    # parse meeting datetime…
+    time_str = extract_time_from_summary(meeting.summary)
+    meeting_dt = parse_meeting_datetime(meeting.meet_date, time_str)
+    if not meeting_dt:
+        return await query.answer("❌ Can't parse meeting time.", show_alert=True)
+
+    remind_dt = meeting_dt - timedelta(minutes=minutes_before)
+    if remind_dt < datetime.now(pytz.timezone("Asia/Singapore")):
+        return await query.answer("❌ That time is already past.", show_alert=True)
+
+    # schedule the job as before…
+    job_id = f"reminder_{meeting_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+    scheduler.add_job(
+        send_reminder,
+        DateTrigger(run_date=remind_dt),
+        args=[context.bot, query.message.chat_id, meeting_id, minutes_before],
+        id=job_id,
+        replace_existing=True
+    )
+
+    # now _update_ the existing summary message instead of replacing it
+    orig = query.message.text
+    # build a human‐friendly label
+    hrs, mins = divmod(minutes_before, 60)
+    label = f"{hrs}h" + (f"{mins}m" if mins else "")
+    new_line = f"\n⏰ Reminder set: {label} before meeting"
+    markup = query.message.reply_markup
+
+    await query.edit_message_text(
+        text=orig + new_line,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+
+# --- the actual reminder action ---
+async def send_reminder(bot, chat_id: int, meeting_id: int, mins_before: int):
+    db = SessionLocal()
+    meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+    if not meeting:
+        return
+    text = f"⏰ Reminder: your meeting is in {mins_before} minutes!\n\n{meeting.summary}"
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 # --- GOOGLE MAPS ---
 async def get_nearest_mrt(place):
@@ -690,16 +701,6 @@ async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYP
         meeting = Meeting(chat_id=chat_id, summary=summary, meet_date=meet_date)
         db.add(meeting)
         db.commit()
-
-         # Schedule reminder if we have both date and time
-        time_str = extract_time_from_summary(summary)
-        if meet_date and time_str:
-            meeting_datetime = parse_meeting_datetime(meet_date, time_str)
-            if meeting_datetime:
-                reminder_time = schedule_reminder(update.get_bot(), chat_id, meeting_datetime, summary, meeting.id)
-                if reminder_time:
-                    summary += f"\n\n⏰ **Reminder set for {reminder_time.strftime('%A, %B %d at %I:%M %p')}**"
-
         sync_link = f"{os.getenv('DOMAIN_BASE_URL')}/login?telegram_id={update.effective_user.id}&meeting_id={meeting.id}"
         final_message = (
             f"📋 Final Summary:\n\n{summary}\n\n"
@@ -841,30 +842,6 @@ async def start_edit_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.message.reply_text("⚠️ Invalid meeting ID.")
 
-
-
-async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel a scheduled reminder for a meeting"""
-    args = context.args
-    if not args:
-        await update.message.reply_text("❓ Please provide the meeting ID.\nExample: /cancelreminder 3")
-        return
-
-    try:
-        meeting_id = int(args[0])
-        job_id = f"reminder_{meeting_id}"
-        
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-            await update.message.reply_text(f"✅ Reminder cancelled for meeting ID {meeting_id}")
-        else:
-            await update.message.reply_text(f"❌ No active reminder found for meeting ID {meeting_id}")
-            
-    except ValueError:
-        await update.message.reply_text("⚠️ Invalid meeting ID.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error cancelling reminder: {e}")
-
 async def perform_meeting_deletion(chat_id, meeting_id, context):
     db = SessionLocal()
     meeting = db.query(Meeting).filter_by(id=meeting_id, chat_id=chat_id).first()
@@ -904,15 +881,6 @@ async def clear_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id=chat_id, text="ℹ️ No meetings found to delete in this chat.")
 
-# --- STARTUP FUNCTION ---
-async def post_init(application):
-    """Initialize scheduler after the event loop is running"""
-    try:
-        scheduler.start()
-        print("📅 Reminder scheduler started successfully")
-    except Exception as e:
-        print(f"❌ Failed to start scheduler: {e}")
-
 # --- APP SETUP ---
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -924,17 +892,15 @@ async def main():
     app.add_handler(CommandHandler("listmeetings", list_meetings))
     app.add_handler(CommandHandler("deletemeeting", delete_meeting))
     app.add_handler(CommandHandler("editmeeting", start_edit_meeting))
-    app.add_handler(CommandHandler("cancelreminder", cancel_reminder))
-    app.add_handler(CommandHandler("clearmeetings", clear_meetings))  # ✅ New command
+    app.add_handler(CommandHandler("clearmeetings", clear_meetings)) 
     app.add_handler(CallbackQueryHandler(meeting_button_handler))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
     # Passive message tracking
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_group_message))
 
-    # Initialize the application and start scheduler
+    scheduler.start()
     await app.initialize()
-    await post_init(app)
 
     print("✅ Bot is running and ready for group chat...")
 
@@ -951,7 +917,6 @@ async def main():
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-        scheduler.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
