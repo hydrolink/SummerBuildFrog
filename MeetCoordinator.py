@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ChatMemberHandler
 from openai import OpenAI
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import re
 import dateparser
 import googlemaps
@@ -744,7 +744,8 @@ def create_ics_file(meeting_title: str,
     ev.duration    = timedelta(minutes=duration_minutes)
     ev.description = description
     ev.uid         = f"{uuid.uuid4()}@meetcoord.local"
-    ev.created     = datetime.utcnow().replace(tzinfo=pytz.utc)
+    # use a timezone-aware UTC now
+    ev.created     = datetime.now(timezone.utc)
 
     cal.events.add(ev)
 
