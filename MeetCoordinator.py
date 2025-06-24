@@ -144,6 +144,38 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     text = update.message.text
 
+        # --- Custom reminder input handler ---
+    if "awaiting_custom_reminder_for" in context.user_data:
+        meeting_id = context.user_data.pop("awaiting_custom_reminder_for")
+        duration = parse_custom_duration(text)
+        if duration is None:
+            await update.message.reply_text("❌ Invalid format. Try something like `90m` or `1h30m`.")
+            return
+
+        # Create a fake CallbackQuery object with the needed format
+        class DummyQuery:
+            def __init__(self, message, chat_id):
+                self.message = message
+                self.chat_id = chat_id
+                self.text = message.text
+                self.reply_markup = message.reply_markup
+
+            async def answer(self):
+                pass
+
+            async def edit_message_text(self, text, parse_mode=None, reply_markup=None):
+                await context.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+
+        dummy_query = DummyQuery(update.message, update.effective_chat.id)
+        await schedule_reminder(dummy_query, context, meeting_id, duration)
+        return
+
+
     # --- Editing flow ---
     if user_id in editing_sessions:
         session = editing_sessions[user_id]
@@ -223,7 +255,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 # --- DATE EXTRACTION ---
 def extract_meeting_date(original_messages, gpt_summary, current_date=None):
     """
-    Extract meeting date from original messages and GPT summary with better context awareness
+    Extract meeting date from original messages and GPT summary with better context awareness.
+    Clamps same-month/day parses back to the current year.
     """
     if current_date is None:
         current_date = date.today()
@@ -244,38 +277,48 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
         r'\b(\d{1,2}-\d{1,2}(?:-\d{2,4})?)\b'
     ]
     
+    # Helper to adjust year if month/day == today
+    def clamp_year(dt: datetime) -> datetime:
+        if dt.month == current_date.month and dt.day == current_date.day:
+            return dt.replace(year=current_date.year)
+        return dt
+
     # Try to find date mentions in original messages
     for message in all_messages:
         message_lower = message.lower()
         for pattern in date_patterns:
-            matches = re.findall(pattern, message_lower, re.IGNORECASE)
-            for match in matches:
-                # Parse with current date as reference
-                parsed_date = dateparser.parse(
-                    match, 
+            for match in re.findall(pattern, message_lower, re.IGNORECASE):
+                parsed = dateparser.parse(
+                    match,
                     settings={
                         'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
                         'PREFER_DATES_FROM': 'future'
                     }
                 )
-                if parsed_date and parsed_date.date() >= current_date:
-                    return parsed_date.date()
-    
-        # NEW — find line that starts with 📅 Date:
+                if parsed:
+                    parsed = clamp_year(parsed)
+                    if parsed.date() >= current_date:
+                        return parsed.date()
+
+    # Then look for a “📅 Date:” line in the GPT summary
     for line in gpt_summary.splitlines():
         if line.strip().startswith("📅 Date:"):
             date_text = line.split("📅 Date:")[1].strip()
-            parsed_date = dateparser.parse(
+            parsed = dateparser.parse(
                 date_text,
                 settings={
                     'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
                     'PREFER_DATES_FROM': 'future'
                 }
             )
-            if parsed_date and parsed_date.date() >= current_date:
-                return parsed_date.date()
-            break  # stop after the first valid 📅 Date
+            if parsed:
+                parsed = clamp_year(parsed)
+                if parsed.date() >= current_date:
+                    return parsed.date()
+            break  # only consider the first “📅 Date:”
+
     return None
+
 
 # Making Buttons 
 from telegram import InputFile
@@ -401,7 +444,6 @@ async def schedule_reminder(query, context, meeting_id: int, minutes_before: int
     if not meeting or not meeting.meet_date:
         return await query.answer("❌ Missing meeting date.", show_alert=True)
 
-    # parse meeting datetime…
     time_str = extract_time_from_summary(meeting.summary)
     meeting_dt = parse_meeting_datetime(meeting.meet_date, time_str)
     if not meeting_dt:
@@ -411,31 +453,32 @@ async def schedule_reminder(query, context, meeting_id: int, minutes_before: int
     if remind_dt < datetime.now(pytz.timezone("Asia/Singapore")):
         return await query.answer("❌ That time is already past.", show_alert=True)
 
-    # schedule the job as before…
+    # schedule the job
     job_id = f"reminder_{meeting_id}"
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
+
+    print(f"✅ Scheduled reminder for {meeting_id} in {minutes_before} minutes at {remind_dt}")
+
     scheduler.add_job(
-        send_reminder,
+        send_reminder,                    # directly schedule the coroutine
         DateTrigger(run_date=remind_dt),
         args=[context.bot, query.message.chat_id, meeting_id, minutes_before],
         id=job_id,
         replace_existing=True
     )
 
-    # now _update_ the existing summary message instead of replacing it
+    # update the summary message
     orig = query.message.text
-    # build a human‐friendly label
     hrs, mins = divmod(minutes_before, 60)
     label = f"{hrs}h" + (f"{mins}m" if mins else "")
     new_line = f"\n⏰ Reminder set: {label} before meeting"
-    markup = query.message.reply_markup
-
     await query.edit_message_text(
         text=orig + new_line,
         parse_mode="Markdown",
-        reply_markup=markup
+        reply_markup=query.message.reply_markup
     )
+
 
 
 # --- the actual reminder action ---
@@ -446,6 +489,22 @@ async def send_reminder(bot, chat_id: int, meeting_id: int, mins_before: int):
         return
     text = f"⏰ Reminder: your meeting is in {mins_before} minutes!\n\n{meeting.summary}"
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+def parse_custom_duration(text: str) -> int:
+    """
+    Parse a duration string like '90m', '1h', '1h30m' into total minutes.
+    Returns None if invalid.
+    """
+    pattern = r"(?:(\d+)h)?(?:(\d+)m)?"
+    match = re.fullmatch(pattern, text.strip().lower())
+    if not match:
+        return None
+
+    hours = int(match.group(1)) if match.group(1) else 0
+    minutes = int(match.group(2)) if match.group(2) else 0
+    total_minutes = hours * 60 + minutes
+    return total_minutes if total_minutes > 0 else None
+
 
 # --- GOOGLE MAPS ---
 async def get_nearest_mrt(place):
