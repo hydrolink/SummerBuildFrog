@@ -133,7 +133,6 @@ async def stop_listening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_availability(update, context, chat_id)
     del listening_sessions[chat_id]  # Clear after processing
 
-
 # --- MESSAGE HANDLING ---
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -214,29 +213,30 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
             updated_lines = []
             for line in lines:
-                # Date, Time, Pax, Activity: just swap in the new text
-                if field != 'place' and line.lower().startswith(f"{field}:"):
-                    prefix = line.split(':', 1)[0]
-                    updated_lines.append(f"{prefix}: {user_text}")
+                # split label and content
+                if ':' in line:
+                    label, rest = line.split(':', 1)
+                    # normalize label by removing emoji/punctuation
+                    key = re.sub(r'[^\w ]', '', label).strip().lower()
+                else:
+                    updated_lines.append(line)
+                    continue
 
-                # PLACE: rebuild place + fresh map/MRT/bus
-                elif field == 'place' and line.lower().startswith("📍 place:"):
-                    # 1) New Place
+                # non-place fields: match on normalized key
+                if field != 'place' and key == field:
+                    updated_lines.append(f"{label}: {user_text}")
+
+                # place field: rebuild full block
+                elif field == 'place' and key == 'place':
                     updated_lines.append(f"📍 Place: {user_text}")
-
-                    # 2) New Map link
                     map_url = f"https://www.google.com/maps/search/?api=1&query={quote(user_text)}"
                     updated_lines.append(f"🌐 Map: {map_url}")
-
-                    # 3) Nearest MRT
                     mrt = await get_nearest_mrt(user_text)
                     updated_lines.append(f"🚇 Nearest MRT: {mrt}")
-
-                    # 4) Nearest Bus Stop
                     bus = await find_nearest_bus_stop(user_text)
                     updated_lines.append(f"🚌 Nearest Bus Stop: {bus}")
 
-                # Everything else stays the same
+                # everything else stays the same
                 else:
                     updated_lines.append(line)
 
@@ -297,14 +297,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
-      
             return
 
     # --- Normal listening mode ---
     if chat_id in listening_sessions:
         user = update.message.from_user.full_name
         listening_sessions[chat_id].setdefault(user, []).append(user_text)
-
 
 # --- DATE EXTRACTION ---
 def extract_meeting_date(original_messages, gpt_summary, current_date=None):
@@ -420,130 +418,141 @@ async def send_final_summary_with_buttons(context, chat_id, summary_text, meetin
     db.close()
 
 
-
-
 async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data = query.data or ""
 
-    # --- STEP 1: prompt for delete ---
-    if data.startswith("delete_prompt:"):
-        meeting_id = int(data.split(":",1)[1])
-        kb = [
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_delete:{meeting_id}"),
-            InlineKeyboardButton("❌ Cancel",       callback_data=f"cancel_delete:{meeting_id}")
-        ]
-        await query.edit_message_text(
-            text="⚠️ Are you sure you want to delete this meeting?",
-            reply_markup=InlineKeyboardMarkup([kb])
-        )
+    try:
+        # --- STEP 1: prompt for delete ---
+        if data.startswith("delete_prompt:"):
+            meeting_id = int(data.split(":", 1)[1])
+            # guard: only prompt if meeting still exists
+            db = SessionLocal()
+            exists = db.query(Meeting.id).filter_by(id=meeting_id).first()
+            db.close()
+            if not exists:
+                return await query.edit_message_text("❌ Meeting not found.")
+            kb = [
+                InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_delete:{meeting_id}"),
+                InlineKeyboardButton("❌ Cancel",       callback_data=f"cancel_delete:{meeting_id}")
+            ]
+            return await query.edit_message_text(
+                text="⚠️ Are you sure you want to delete this meeting?",
+                reply_markup=InlineKeyboardMarkup([kb])
+            )
 
-    # --- STEP 2: confirm deletion ---
-    elif data.startswith("confirm_delete:"):
-        meeting_id = int(data.split(":",1)[1])
-        success = await perform_meeting_deletion(update.effective_chat.id, meeting_id, context)
-        if success:
-            await query.edit_message_text("✅ Meeting deleted.")
-        else:
-            await query.edit_message_text("❌ Meeting not found.")
+        # --- STEP 2: confirm deletion ---
+        elif data.startswith("confirm_delete:"):
+            meeting_id = int(data.split(":", 1)[1])
+            success = await perform_meeting_deletion(update.effective_chat.id, meeting_id, context)
+            if success:
+                return await query.edit_message_text("✅ Meeting deleted.")
+            else:
+                return await query.edit_message_text("❌ Meeting not found.")
 
-    # --- STEP 3: cancel deletion, restore original summary + buttons ---
-    elif data.startswith("cancel_delete:"):
-        meeting_id = int(data.split(":",1)[1])
-        db = SessionLocal()
-        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
-        db.close()
-
-        if meeting:
+        # --- STEP 3: cancel deletion ---
+        elif data.startswith("cancel_delete:"):
+            meeting_id = int(data.split(":", 1)[1])
+            db = SessionLocal()
+            meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+            db.close()
+            if not meeting:
+                return await query.edit_message_text("❌ Meeting not found.")
             buttons = [
                 [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
                 [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
                 [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f'setreminder:{meeting_id}')]
             ]
-            await query.edit_message_text(
+            return await query.edit_message_text(
                 text=meeting.summary,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
 
-    elif data.startswith("edit:"):
-        meeting_id = int(data.split(":")[1])
-        await perform_edit_start(update.effective_user.id, update.effective_chat.id, meeting_id, context)
+        # --- Edit meeting flow ---
+        elif data.startswith("edit:"):
+            meeting_id = int(data.split(":", 1)[1])
+            return await perform_edit_start(
+                update.effective_user.id, 
+                update.effective_chat.id, 
+                meeting_id, 
+                context
+            )
 
-    elif data.startswith("editfield:"):
-        parts = data.split(":")
-        meeting_id = int(parts[1])
-        field = parts[2]
-        user_id = update.effective_user.id
-        editing_sessions[user_id] = {
-            'step': 'enter_value',
-            'meeting_id': meeting_id,
-            'field': field
-        }
+        elif data.startswith("editfield:"):
+            parts = data.split(":")
+            meeting_id, field = int(parts[1]), parts[2]
+            # re-use same session safety
+            editing_sessions[update.effective_user.id] = {
+                'step': 'enter_value',
+                'meeting_id': meeting_id,
+                'field': field
+            }
+            field_name = field.capitalize()
+            return await query.edit_message_text(
+                f"✏️ Please enter the new value for *{field_name}*:",
+                parse_mode="Markdown"
+            )
 
-        field_name = field.capitalize()
-        await query.edit_message_text(
-            f"✏️ Please enter the new value for *{field_name}*:",
-            parse_mode="Markdown"
-        )
-
-
-    elif data.startswith("view:"):
-        meeting_id = int(data.split(":")[1])
-        db = SessionLocal()
-        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
-        if meeting:
-            await query.edit_message_text(meeting.summary, parse_mode="Markdown")
-        else:
-            await query.edit_message_text("❌ Meeting not found.")
-
-    elif data.startswith("setreminder:"):
-        meeting_id = int(data.split(":",1)[1])
-        await offer_reminder_presets(query, context, meeting_id)
-
-    elif data.startswith("cancel_reminder:"):
-        meeting_id = int(data.split(":", 1)[1])
-        job_id = f"reminder_{meeting_id}"
-
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-
-            # Reload the up-to-date summary
+        # --- View summary ---
+        elif data.startswith("view:"):
+            meeting_id = int(data.split(":", 1)[1])
             db = SessionLocal()
             meeting = db.query(Meeting).filter_by(id=meeting_id).first()
             db.close()
+            if not meeting:
+                return await query.edit_message_text("❌ Meeting not found.")
+            return await query.edit_message_text(meeting.summary, parse_mode="Markdown")
 
-            # Rebuild buttons to offer "Set Reminder" again
-            buttons = [
-                [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
-                [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
-                [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f"setreminder:{meeting_id}")]
-            ]
+        # --- Reminder controls ---
+        elif data.startswith("setreminder:"):
+            meeting_id = int(data.split(":", 1)[1])
+            return await offer_reminder_presets(query, context, meeting_id)
 
-            await query.edit_message_text(
-                text=f"📋 Final Summary:\n\n{meeting.summary}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons)
+        elif data.startswith("cancel_reminder:"):
+            meeting_id = int(data.split(":", 1)[1])
+            job_id = f"reminder_{meeting_id}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+                # refresh buttons
+                db = SessionLocal()
+                meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+                db.close()
+                buttons = [
+                    [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+                    [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
+                    [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f"setreminder:{meeting_id}")]
+                ]
+                return await query.edit_message_text(
+                    text=f"📋 Final Summary:\n\n{meeting.summary}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            else:
+                return await query.answer("❌ No active reminder to cancel.", show_alert=True)
+
+        elif data.startswith("remind:"):
+            _, mid, mins = data.split(":")
+            return await schedule_reminder(query, context, int(mid), int(mins))
+
+        elif data.startswith("remindcustom:"):
+            meeting_id = int(data.split(":", 1)[1])
+            context.user_data["awaiting_custom_reminder_for"] = meeting_id
+            return await query.edit_message_text(
+                "✏️ Please enter a custom reminder interval (e.g. `90m` or `2h30m`):",
+                parse_mode="Markdown"
             )
+
         else:
-            await query.answer("❌ No active reminder to cancel.", show_alert=True)
+            # catch any unknown or stale callback_data
+            return await query.answer("⚠️ This action is no longer available.", show_alert=True)
 
+    except Exception as e:
+        print(f"Error in meeting_button_handler: {e}")
+        # inform user without exposing internals
+        await query.answer("❌ An error occurred. Please try again.", show_alert=True)
 
-    elif data.startswith("remind:"):
-        # pattern remind:<meeting_id>:<minutes>
-        _, mid, mins = data.split(":")
-        await schedule_reminder(query, context, int(mid), int(mins))
-
-    elif data.startswith("remindcustom:"):
-        meeting_id = int(data.split(":",1)[1])
-        # ask user to type e.g. "90m" or "2h30m"
-        await query.edit_message_text(
-            "✏️ Please enter a custom reminder interval (e.g. `90m` or `2h30m`):",
-            parse_mode="Markdown"
-        )
-        # store state so the next text message from this user is parsed as a custom interval
-        context.user_data["awaiting_custom_reminder_for"] = meeting_id
 
 # --- helper to show preset buttons ---
 async def offer_reminder_presets(query, context, meeting_id):
