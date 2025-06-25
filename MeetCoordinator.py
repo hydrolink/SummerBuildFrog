@@ -199,11 +199,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(f"✏️ Please enter the new value for *{text}*:", parse_mode="Markdown")
             return
 
+# Step 2: user entered the new value
         elif step == 'enter_value':
             field = session['field']
             lines = meeting.summary.split('\n')
+            # 1) build updated_lines
             updated_lines = []
-
             for line in lines:
                 if field in line.lower():
                     prefix = line.split(':')[0]
@@ -211,34 +212,62 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 else:
                     updated_lines.append(line)
 
-            # Validation for 'date' or 'time' field
+            # 2) validate date/time if needed
             if field == 'date':
                 parsed_date = dateparser.parse(text)
                 if not parsed_date or parsed_date.date() < date.today():
-                    await update.message.reply_text("❌ Invalid date. Please enter a future date like `next Friday` or `July 10`.")
+                    await context.bot.send_message(chat_id=chat_id, text="❌ Invalid date. Please enter a future date like `next Friday`.")
+                    db.close()
                     return
-
                 meeting.meet_date = parsed_date.date()
-
             elif field == 'time':
                 parsed_time = dateparser.parse(text)
                 if not parsed_time:
-                    await update.message.reply_text("❌ Invalid time. Please enter something like `7pm`, `19:30`, or `8:15am`.")
+                    await context.bot.send_message(chat_id=chat_id, text="❌ Invalid time. Please enter like `7pm` or `19:30`.")
+                    db.close()
                     return
 
-            # Update summary
+            # 3) commit changes
             meeting.summary = '\n'.join(updated_lines)
-            db.commit()    
-            del editing_sessions[user_id]
-            buttons = [
-                [InlineKeyboardButton("✏️ Edit More", callback_data=f"edit:{meeting.id}")],
-                [InlineKeyboardButton("👁️ View Summary", callback_data=f"view:{meeting.id}")]
-            ]
+            db.commit()
 
-            await update.message.reply_text(
-                "✅ Meeting updated successfully!",
-                reply_markup=InlineKeyboardMarkup(buttons)
+            # 4) capture before closing session
+            meeting_id   = meeting.id
+            summary_text = meeting.summary
+            db.close()
+            del editing_sessions[user_id]
+
+            # 5) rebuild the “Final Summary” with your Outlook sync link
+            domain    = os.getenv('DOMAIN_BASE_URL')
+            sync_link = f"{domain}/login?telegram_id={update.effective_user.id}&meeting_id={meeting_id}"
+            final_message = (
+                f"📋 Final Summary:\n\n{summary_text}\n\n"
+                f"🔗 [🗓️ Click here to add to Outlook Calendar]({sync_link})"
             )
+
+            # 6) edit the original summary message in-place
+            msg_id = context.chat_data.get(f"meeting_msg_{meeting_id}")
+            buttons = [
+                [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+                [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
+                [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f'setreminder:{meeting_id}')]
+            ]
+            if msg_id:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=final_message,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            else:
+                # fallback if we lost the ID
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=final_message,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
 
             return
 
@@ -250,44 +279,56 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             listening_sessions[chat_id][user] = []
         listening_sessions[chat_id][user].append(message)
 
-
-
 # --- DATE EXTRACTION ---
 def extract_meeting_date(original_messages, gpt_summary, current_date=None):
     """
-    Extract meeting date from original messages and GPT summary with better context awareness.
+    1) Look for “📅 Date:” in the GPT summary and parse it.
+    2) If that fails, scan the raw chat for explicit date tokens.
     Clamps same-month/day parses back to the current year.
     """
     if current_date is None:
         current_date = date.today()
-    
-    # First, try to extract from original messages (more reliable)
+
+    # 1) Try GPT summary first
+    for line in gpt_summary.splitlines():
+        if line.strip().startswith("📅 Date:"):
+            date_text = line.split("📅 Date:")[1].strip()
+            parsed = dateparser.parse(
+                date_text,
+                settings={
+                    'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
+                    'PREFER_DATES_FROM': 'future'
+                }
+            )
+            if parsed and parsed.date() >= current_date:
+                return parsed.date()
+            # if GPT gave a Date line but it didn't parse to a valid future date, stop here
+            break
+
+    # 2) Fallback: scan raw messages
     all_messages = []
-    for user_messages in original_messages.values():
-        all_messages.extend(user_messages)
-    
-    # Common date patterns people use in chat
+    for msgs in original_messages.values():
+        all_messages.extend(msgs)
+
     date_patterns = [
         r'\b(tomorrow|tmr)\b',
-        r'\b(today|tdy)\b', 
+        r'\b(today|tdy)\b',
         r'\b(next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b',
         r'\b(this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b',
         r'\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)\b',
         r'\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b',
         r'\b(\d{1,2}-\d{1,2}(?:-\d{2,4})?)\b'
     ]
-    
-    # Helper to adjust year if month/day == today
+
     def clamp_year(dt: datetime) -> datetime:
         if dt.month == current_date.month and dt.day == current_date.day:
             return dt.replace(year=current_date.year)
         return dt
 
-    # Try to find date mentions in original messages
     for message in all_messages:
-        message_lower = message.lower()
-        for pattern in date_patterns:
-            for match in re.findall(pattern, message_lower, re.IGNORECASE):
+        msg_low = message.lower()
+        for pat in date_patterns:
+            for match in re.findall(pat, msg_low, re.IGNORECASE):
                 parsed = dateparser.parse(
                     match,
                     settings={
@@ -300,28 +341,9 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
                     if parsed.date() >= current_date:
                         return parsed.date()
 
-    # Then look for a “📅 Date:” line in the GPT summary
-    for line in gpt_summary.splitlines():
-        if line.strip().startswith("📅 Date:"):
-            date_text = line.split("📅 Date:")[1].strip()
-            parsed = dateparser.parse(
-                date_text,
-                settings={
-                    'RELATIVE_BASE': datetime.combine(current_date, datetime.min.time()),
-                    'PREFER_DATES_FROM': 'future'
-                }
-            )
-            if parsed:
-                parsed = clamp_year(parsed)
-                if parsed.date() >= current_date:
-                    return parsed.date()
-            break  # only consider the first “📅 Date:”
-
+    # nothing valid found
     return None
 
-
-# Making Buttons 
-from telegram import InputFile
 
 async def send_final_summary_with_buttons(context, chat_id, summary_text, meeting_id: int):
     # Parse for .ics fields
@@ -341,16 +363,20 @@ async def send_final_summary_with_buttons(context, chat_id, summary_text, meetin
 
 
     buttons = [
-        [InlineKeyboardButton("✏️ Edit Meeting", callback_data=f'edit:{meeting_id}')],
-        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete:{meeting_id}')],
-        [InlineKeyboardButton("⏰ Set Reminder", callback_data=f'setreminder:{meeting_id}')]
+        [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
+        [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f'setreminder:{meeting_id}')]
     ]
-    await context.bot.send_message(
+
+    msg = await context.bot.send_message(
         chat_id=chat_id,
         text=summary_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
+
+    # Store for later edits
+    context.chat_data[f"meeting_msg_{meeting_id}"] = msg.message_id
 
     if ics_buf:
         # ics_buf is a BytesIO with .name == "meeting.ics"
@@ -367,13 +393,45 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     data = query.data
 
-    if data.startswith("delete:"):
-        meeting_id = int(data.split(":")[1])
+    # --- STEP 1: prompt for delete ---
+    if data.startswith("delete_prompt:"):
+        meeting_id = int(data.split(":",1)[1])
+        kb = [
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_delete:{meeting_id}"),
+            InlineKeyboardButton("❌ Cancel",       callback_data=f"cancel_delete:{meeting_id}")
+        ]
+        await query.edit_message_text(
+            text="⚠️ Are you sure you want to delete this meeting?",
+            reply_markup=InlineKeyboardMarkup([kb])
+        )
+
+    # --- STEP 2: confirm deletion ---
+    elif data.startswith("confirm_delete:"):
+        meeting_id = int(data.split(":",1)[1])
         success = await perform_meeting_deletion(update.effective_chat.id, meeting_id, context)
         if success:
             await query.edit_message_text("✅ Meeting deleted.")
         else:
             await query.edit_message_text("❌ Meeting not found.")
+
+    # --- STEP 3: cancel deletion, restore original summary + buttons ---
+    elif data.startswith("cancel_delete:"):
+        meeting_id = int(data.split(":",1)[1])
+        db = SessionLocal()
+        meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+        db.close()
+
+        if meeting:
+            buttons = [
+                [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+                [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
+                [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f'setreminder:{meeting_id}')]
+            ]
+            await query.edit_message_text(
+                text=meeting.summary,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
 
     elif data.startswith("edit:"):
         meeting_id = int(data.split(":")[1])
@@ -816,20 +874,21 @@ def create_ics_file(meeting_title: str,
     buf.seek(0)
     return buf
 
-
-
 async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db = SessionLocal()
     meetings = db.query(Meeting).filter_by(chat_id=chat_id).all()
 
     if not meetings:
-        await update.message.reply_text("📭 No saved meetings found.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📭 No saved meetings found."
+        )
         return
 
     for m in meetings:
-        date_str = m.meet_date.strftime('%b %d') if m.meet_date else "?"
-        time_str = "?"  # Extract from summary
+        date_str  = m.meet_date.strftime('%b %d') if m.meet_date else "?"
+        time_str  = "?"
         place_str = "?"
 
         for line in m.summary.splitlines():
@@ -839,19 +898,22 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 place_str = line.split("📍 Place:")[1].strip()
 
         text = f"🆔 *ID {m.id}* | 📅 *{date_str}* | 🕒 *{time_str}* | 📍 *{place_str}*"
+
         buttons = [
             [
-                InlineKeyboardButton("👁️ View", callback_data=f"view:{m.id}"),
-                InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{m.id}"),
-                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{m.id}")
+                InlineKeyboardButton("👁️ View",   callback_data=f"view:{m.id}"),
+                InlineKeyboardButton("✏️ Edit",   callback_data=f"edit:{m.id}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_prompt:{m.id}")
             ]
         ]
 
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
+
 
 async def perform_edit_start(user_id, chat_id, meeting_id, context):
     db = SessionLocal()
