@@ -76,39 +76,32 @@ def parse_meeting_datetime(meet_date: date, time_str: str) -> datetime:
 # --- COMMANDS 
 
 async def welcome_on_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        new_status = update.my_chat_member.new_chat_member.status
-        if new_status == "member":  # or "administrator" if added as admin
-            chat = update.effective_chat
-            await context.bot.send_message(
-            chat.id,
-            escape_markdown_v2(
-                "👋 *Welcome to your group's personal meeting assistant\\!* I'm \\@coordinator\\_meetbot — your AI scheduler\\. 🧠🤖\n\n"
-                "📌 *Here's how I can help:*\n"
-                "I listen to your group chat and generate smart summaries for your meetups\\. This includes:\n"
-                "• 📅 *Date*\n"
-                "• 🕒 *Time*\n"
-                "• 📍 *Place* with nearest MRT info\n"
-                "• 👥 *Attendees*\n"
-                "• 🎯 *Activity*\n\n"
-                "• ⏰ *Auto reminders* 12 hours before your meeting\\!\n\n"
-                "▶️ *To get started:*\n"
-                "1\\. Type `/startlistening` — I'll start collecting messages\\.\n"
-                "2\\. Chat naturally about your meeting plans\\.\n"
-                "3\\. Type `/stoplistening` — I'll process everything and summarize\\.\n\n"
-                "🧠 *Other useful commands:*\n"
-                "`/listmeetings` – View all previous summaries\n"
-                "`/deletemeeting <id>` – Delete a saved summary\n\n"
-                "`/cancelreminder <id>` – Cancel a scheduled reminder\n\n"
-                "🔒 I *only listen* when you explicitly tell me to\\.\n"
-                "Let's make planning smooth and stress\\-free\\. 🗓️✨"
-            ),
-            parse_mode="MarkdownV2"
-        )
+    new_status = update.my_chat_member.new_chat_member.status
+    if new_status != "member":
+        return
 
+    text = (
+        "👋 *Hello and welcome! I'm @coordinator_meetbot, your AI-powered meeting assistant.*\n\n"
+        "📌 *What I do for your group chat:*\n"
+        " • Auto-listen to your planning (when you ask)\n"
+        " • Summarize 📅 Date, 🕒 Time, 📍 Place, 👥 Attendees & 🎯 Activity\n"
+        " • Fetch nearest 🚇 MRT & 🚌 bus stops\n"
+        " • Generate an Outlook 📆 calendar link & .ics file\n"
+        " • Send ⏰ reminders (default 12 h before)\n\n"
+        "▶️ *Getting started:*\n"
+        "1️⃣ `/startlistening` — I’ll capture your chat\n"
+        "2️⃣ Chat freely about date/time/place/etc.\n"
+        "3️⃣ `/stoplistening` — I’ll post a neat summary\n\n"
+        "🔧 *Quick commands:* `/listmeetings`, `/editmeeting <id>`, `/deletemeeting <id>`, `/cancelreminder <id>`\n\n"
+        "🔒 I only record when you ask. Let’s make planning smooth and stress-free! 🗓️✨"
+    )
 
-    except Exception as e:
-        print("Error in welcome message:", e)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=escape_markdown_v2(text),
+        parse_mode="MarkdownV2"
+    )
+
 
 
 async def start_listening(update: Update, context: ContextTypes.DEFAULT_TYPE):
