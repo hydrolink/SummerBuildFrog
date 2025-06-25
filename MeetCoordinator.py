@@ -437,7 +437,7 @@ async def offer_reminder_presets(query, context, meeting_id):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# --- helper to schedule the reminder job Test ---
+# --- helper to schedule the reminder job ---
 async def schedule_reminder(query, context, meeting_id: int, minutes_before: int):
     db = SessionLocal()
     meeting = db.query(Meeting).filter_by(id=meeting_id).first()
