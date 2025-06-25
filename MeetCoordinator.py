@@ -1,7 +1,6 @@
 import os
 from db import SessionLocal, Meeting
 from dotenv import load_dotenv
-from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ChatMemberHandler, CallbackQueryHandler
 from openai import OpenAI
 from datetime import datetime, date, timedelta, timezone
@@ -14,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from ics import Calendar, Event as IcsEvent
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update,InputFile,InlineKeyboardButton, InlineKeyboardMarkup
 import aiohttp
 import tempfile
 import subprocess
@@ -22,8 +21,6 @@ import uuid
 from io import BytesIO
 
 editing_sessions = {}
-
-
 
 # Load environment variables
 load_dotenv()
@@ -138,29 +135,28 @@ async def stop_listening(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- MESSAGE HANDLING ---
-
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    text = update.message.text
 
-        # --- Custom reminder input handler ---
+    # Safely grab the incoming text (or empty string if None)
+    user_text = update.message.text or ""
+
+    # --- Custom reminder input handler ---
     if "awaiting_custom_reminder_for" in context.user_data:
         meeting_id = context.user_data.pop("awaiting_custom_reminder_for")
-        duration = parse_custom_duration(text)
+        duration = parse_custom_duration(user_text)
         if duration is None:
             await update.message.reply_text("❌ Invalid format. Try something like `90m` or `1h30m`.")
             return
 
-        # Create a fake CallbackQuery object with the needed format
         class DummyQuery:
             def __init__(self, message, chat_id):
                 self.message = message
                 self.chat_id = chat_id
-                self.text = message.text
-                self.reply_markup = message.reply_markup
+                self.from_user = message.from_user
 
-            async def answer(self):
+            async def answer(self, *args, **kwargs):
                 pass
 
             async def edit_message_text(self, text, parse_mode=None, reply_markup=None):
@@ -171,10 +167,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     reply_markup=reply_markup
                 )
 
-        dummy_query = DummyQuery(update.message, update.effective_chat.id)
+        dummy_query = DummyQuery(update.message, chat_id)
         await schedule_reminder(dummy_query, context, meeting_id, duration)
         return
-
 
     # --- Editing flow ---
     if user_id in editing_sessions:
@@ -188,70 +183,105 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("❌ Meeting not found (may have been deleted). Edit cancelled.")
             return
 
-
+        # STEP 1: choose which field
         if step == 'choose_field':
-            if text.lower() not in ['date', 'time', 'place', 'pax', 'activity']:
+            choice = user_text.lower()
+            if choice not in ['date', 'time', 'place', 'pax', 'activity']:
                 await update.message.reply_text("❌ Invalid field. Please choose a valid option below.")
                 await perform_edit_start(user_id, chat_id, session['meeting_id'], context)
                 return
-            session['field'] = text.lower()
+
+            session['field'] = choice
             session['step'] = 'enter_value'
-            await update.message.reply_text(f"✏️ Please enter the new value for *{text}*:", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"✏️ Please enter the new value for *{choice}*:", parse_mode="Markdown"
+            )
             return
 
-# Step 2: user entered the new value
+        # STEP 2: user has entered the new value
         elif step == 'enter_value':
             field = session['field']
             lines = meeting.summary.split('\n')
-            # 1) build updated_lines
+
+            # If we're editing the place, drop any existing map/transit lines first
+            if field == 'place':
+                lines = [
+                    l for l in lines
+                    if not any(l.startswith(prefix) for prefix in (
+                        "🌐 Map:", "🚇 Nearest MRT:", "🚌 Nearest Bus Stop:"
+                    ))
+                ]
+
             updated_lines = []
             for line in lines:
-                if field in line.lower():
-                    prefix = line.split(':')[0]
-                    updated_lines.append(f"{prefix}: {text}")
+                # Date, Time, Pax, Activity: just swap in the new text
+                if field != 'place' and line.lower().startswith(f"{field}:"):
+                    prefix = line.split(':', 1)[0]
+                    updated_lines.append(f"{prefix}: {user_text}")
+
+                # PLACE: rebuild place + fresh map/MRT/bus
+                elif field == 'place' and line.lower().startswith("📍 place:"):
+                    # 1) New Place
+                    updated_lines.append(f"📍 Place: {user_text}")
+
+                    # 2) New Map link
+                    map_url = f"https://www.google.com/maps/search/?api=1&query={quote(user_text)}"
+                    updated_lines.append(f"🌐 Map: {map_url}")
+
+                    # 3) Nearest MRT
+                    mrt = await get_nearest_mrt(user_text)
+                    updated_lines.append(f"🚇 Nearest MRT: {mrt}")
+
+                    # 4) Nearest Bus Stop
+                    bus = await find_nearest_bus_stop(user_text)
+                    updated_lines.append(f"🚌 Nearest Bus Stop: {bus}")
+
+                # Everything else stays the same
                 else:
                     updated_lines.append(line)
 
-            # 2) validate date/time if needed
+            # validate date/time if needed
             if field == 'date':
-                parsed_date = dateparser.parse(text)
+                parsed_date = dateparser.parse(user_text)
                 if not parsed_date or parsed_date.date() < date.today():
-                    await context.bot.send_message(chat_id=chat_id, text="❌ Invalid date. Please enter a future date like `next Friday`.")
+                    await context.bot.send_message(chat_id=chat_id,
+                        text="❌ Invalid date. Please enter a future date like `next Friday`.")
                     db.close()
                     return
                 meeting.meet_date = parsed_date.date()
+
             elif field == 'time':
-                parsed_time = dateparser.parse(text)
+                parsed_time = dateparser.parse(user_text)
                 if not parsed_time:
-                    await context.bot.send_message(chat_id=chat_id, text="❌ Invalid time. Please enter like `7pm` or `19:30`.")
+                    await context.bot.send_message(chat_id=chat_id,
+                        text="❌ Invalid time. Please enter like `7pm` or `19:30`.")
                     db.close()
                     return
 
-            # 3) commit changes
+            # commit changes
             meeting.summary = '\n'.join(updated_lines)
             db.commit()
-
-            # 4) capture before closing session
-            meeting_id   = meeting.id
+            meeting_id = meeting.id
             summary_text = meeting.summary
             db.close()
             del editing_sessions[user_id]
 
-            # 5) rebuild the “Final Summary” with your Outlook sync link
-            domain    = os.getenv('DOMAIN_BASE_URL')
+            # rebuild the final summary with Outlook link
+            domain = os.getenv('DOMAIN_BASE_URL')
             sync_link = f"{domain}/login?telegram_id={update.effective_user.id}&meeting_id={meeting_id}"
             final_message = (
                 f"📋 Final Summary:\n\n{summary_text}\n\n"
                 f"🔗 [🗓️ Click here to add to Outlook Calendar]({sync_link})"
             )
 
-            # 6) edit the original summary message in-place
+            # re-edit the original message (or send a new one)
             msg_id = context.chat_data.get(f"meeting_msg_{meeting_id}")
             buttons = [
-                [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+                [InlineKeyboardButton("✏️ Edit Meeting", callback_data=f'edit:{meeting_id}')],
                 [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
-                [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f'setreminder:{meeting_id}')]
+                [InlineKeyboardButton("⏰ Set Reminder", callback_data=f'setreminder:{meeting_id}')]
             ]
+
             if msg_id:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
@@ -261,23 +291,20 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
             else:
-                # fallback if we lost the ID
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=final_message,
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
-
+      
             return
 
-    # --- Listening mode ---
+    # --- Normal listening mode ---
     if chat_id in listening_sessions:
         user = update.message.from_user.full_name
-        message = update.message.text
-        if user not in listening_sessions[chat_id]:
-            listening_sessions[chat_id][user] = []
-        listening_sessions[chat_id][user].append(message)
+        listening_sessions[chat_id].setdefault(user, []).append(user_text)
+
 
 # --- DATE EXTRACTION ---
 def extract_meeting_date(original_messages, gpt_summary, current_date=None):
@@ -346,45 +373,52 @@ def extract_meeting_date(original_messages, gpt_summary, current_date=None):
 
 
 async def send_final_summary_with_buttons(context, chat_id, summary_text, meeting_id: int):
-    # Parse for .ics fields
-    db = SessionLocal()
+    # Fetch meeting & parse .ics
+    db      = SessionLocal()
     meeting = db.query(Meeting).filter_by(id=meeting_id).first()
     time_str = extract_time_from_summary(meeting.summary)
-    meeting_datetime = parse_meeting_datetime(meeting.meet_date, time_str)
+    meeting_dt = parse_meeting_datetime(meeting.meet_date, time_str)
 
-    # Create .ics file if possible
     ics_buf = None
-    if meeting_datetime:
+    if meeting_dt:
         ics_buf = create_ics_file(
             meeting_title="Group Meeting",
             description=meeting.summary,
-            start_time=meeting_datetime
+            start_time=meeting_dt
         )
 
-
+    # Build the first two buttons
     buttons = [
         [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
-        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
-        [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f'setreminder:{meeting_id}')]
+        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')]
     ]
 
+    # Toggle reminder button
+    job_id  = f"reminder_{meeting_id}"
+    if scheduler.get_job(job_id):
+        buttons.append([InlineKeyboardButton("❌ Cancel Reminder", callback_data=f"cancel_reminder:{meeting_id}")])
+    else:
+        buttons.append([InlineKeyboardButton("⏰ Set Reminder",    callback_data=f"setreminder:{meeting_id}")])
+
+    # Send the summary + buttons
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=summary_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
-
     # Store for later edits
     context.chat_data[f"meeting_msg_{meeting_id}"] = msg.message_id
 
+    # Finally, send the .ics if we built one
     if ics_buf:
-        # ics_buf is a BytesIO with .name == "meeting.ics"
         await context.bot.send_document(
             chat_id=chat_id,
             document=InputFile(ics_buf, filename=ics_buf.name),
             caption="📅 Tap to add this meeting to your calendar!"
         )
+    db.close()
+
 
 
 
@@ -468,6 +502,34 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
         meeting_id = int(data.split(":",1)[1])
         await offer_reminder_presets(query, context, meeting_id)
 
+    elif data.startswith("cancel_reminder:"):
+        meeting_id = int(data.split(":", 1)[1])
+        job_id = f"reminder_{meeting_id}"
+
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+
+            # Reload the up-to-date summary
+            db = SessionLocal()
+            meeting = db.query(Meeting).filter_by(id=meeting_id).first()
+            db.close()
+
+            # Rebuild buttons to offer "Set Reminder" again
+            buttons = [
+                [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+                [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
+                [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f"setreminder:{meeting_id}")]
+            ]
+
+            await query.edit_message_text(
+                text=f"📋 Final Summary:\n\n{meeting.summary}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            await query.answer("❌ No active reminder to cancel.", show_alert=True)
+
+
     elif data.startswith("remind:"):
         # pattern remind:<meeting_id>:<minutes>
         _, mid, mins = data.split(":")
@@ -500,44 +562,64 @@ async def schedule_reminder(query, context, meeting_id: int, minutes_before: int
     db = SessionLocal()
     meeting = db.query(Meeting).filter_by(id=meeting_id).first()
     if not meeting or not meeting.meet_date:
-        return await query.answer("❌ Missing meeting date.", show_alert=True)
+        await query.answer("❌ Missing meeting date.", show_alert=True)
+        db.close()
+        return
 
     time_str = extract_time_from_summary(meeting.summary)
     meeting_dt = parse_meeting_datetime(meeting.meet_date, time_str)
     if not meeting_dt:
-        return await query.answer("❌ Can't parse meeting time.", show_alert=True)
+        await query.answer("❌ Can't parse meeting time.", show_alert=True)
+        db.close()
+        return
 
     remind_dt = meeting_dt - timedelta(minutes=minutes_before)
     if remind_dt < datetime.now(pytz.timezone("Asia/Singapore")):
-        return await query.answer("❌ That time is already past.", show_alert=True)
+        await query.answer("❌ That time is already past.", show_alert=True)
+        db.close()
+        return
 
-    # schedule the job
     job_id = f"reminder_{meeting_id}"
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
 
-    print(f"✅ Scheduled reminder for {meeting_id} in {minutes_before} minutes at {remind_dt}")
-
     scheduler.add_job(
-        send_reminder,                    # directly schedule the coroutine
+        send_reminder,
         DateTrigger(run_date=remind_dt),
         args=[context.bot, query.message.chat_id, meeting_id, minutes_before],
         id=job_id,
         replace_existing=True
     )
 
-    # update the summary message
-    orig = query.message.text
-    hrs, mins = divmod(minutes_before, 60)
-    label = f"{hrs}h" + (f"{mins}m" if mins else "")
-    new_line = f"\n⏰ Reminder set: {label} before meeting"
-    await query.edit_message_text(
-        text=orig + new_line,
-        parse_mode="Markdown",
-        reply_markup=query.message.reply_markup
+    # build sync link
+    domain = os.getenv('DOMAIN_BASE_URL')
+    user    = getattr(query, 'from_user', query.message.from_user)
+    sync_link = f"{domain}/login?telegram_id={user.id}&meeting_id={meeting_id}"
+
+    # build label
+    label = f"{minutes_before//60}h" + (f"{minutes_before%60}m" if minutes_before%60 else "")
+
+    # include both the Outlook link AND the reminder line
+    final_text = (
+        f"📋 Final Summary:\n\n"
+        f"{meeting.summary}\n\n"
+        f"🔗 [🗓️ Click here to add to Outlook Calendar]({sync_link})\n\n"
+        f"⏰ Reminder set: {label} before meeting"
     )
 
+    buttons = [
+        [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f'edit:{meeting_id}')],
+        [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f'delete_prompt:{meeting_id}')],
+        [InlineKeyboardButton("❌ Cancel Reminder", callback_data=f"cancel_reminder:{meeting_id}")]
+    ]
 
+    await query.edit_message_text(
+        text=final_text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+    db.close()
 
 # --- the actual reminder action ---
 async def send_reminder(bot, chat_id: int, meeting_id: int, mins_before: int):
@@ -779,6 +861,16 @@ async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Extract the date from messages and GPT output
         meet_date = extract_meeting_date(group_data, summary, today)
+        time_str  = extract_time_from_summary(summary)
+        meeting_dt = parse_meeting_datetime(meet_date, time_str)
+        now = datetime.now(pytz.timezone("Asia/Singapore"))
+        if meeting_dt and meeting_dt < now:
+            await update.message.reply_text(
+                "❌ The proposed meeting time "
+                f"({meet_date} {time_str}) has already passed—"
+                "please agree a future date/time and try again."
+            )
+            return
 
         # Try to extract place line and fetch nearest MRT
         place = None
@@ -790,19 +882,6 @@ async def process_availability(update: Update, context: ContextTypes.DEFAULT_TYP
         if place:
             mrt_info = await get_nearest_mrt(place)
             google_maps_url = f"https://www.google.com/maps/search/?api=1&query={place.replace(' ', '+')}"
-
-            try:
-                geocode_result = gmaps.geocode(place)
-                if geocode_result:
-                    location = geocode_result[0]["geometry"]["location"]
-                    lat, lng = location["lat"], location["lng"]
-
-                    # Send a Telegram location message
-                    await update.message.reply_location(latitude=lat, longitude=lng)
-            except Exception as e:
-                print(f"⚠️ Failed to send location: {e}")
-
-
             new_lines = []
             for line in summary.split('\n'):
                 if "place" in line.lower():
