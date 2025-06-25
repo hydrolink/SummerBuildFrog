@@ -502,8 +502,33 @@ async def meeting_button_handler(update: Update, context: ContextTypes.DEFAULT_T
             meeting = db.query(Meeting).filter_by(id=meeting_id).first()
             db.close()
             if not meeting:
-                return await query.edit_message_text("❌ Meeting not found.")
-            return await query.edit_message_text(meeting.summary, parse_mode="Markdown")
+                await query.answer("❌ Meeting not found.", show_alert=True)
+                return
+
+            # Build full summary with Outlook link
+            summary = meeting.summary
+            sync_link = (
+                f"{os.getenv('DOMAIN_BASE_URL')}"
+                f"/login?telegram_id={query.from_user.id}&meeting_id={meeting_id}"
+            )
+            full_text = (
+                f"{summary}\n\n"
+                f"🔗 [🗓️ Add to Outlook Calendar]({sync_link})"
+            )
+
+            # Rebuild the action buttons
+            buttons = [
+                [InlineKeyboardButton("✏️ Edit Meeting",   callback_data=f"edit:{meeting_id}")],
+                [InlineKeyboardButton("🗑️ Delete Meeting", callback_data=f"delete_prompt:{meeting_id}")],
+                [InlineKeyboardButton("⏰ Set Reminder",    callback_data=f"setreminder:{meeting_id}")]
+            ]
+            markup = InlineKeyboardMarkup(buttons)
+
+            await query.edit_message_text(
+                text=full_text,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
 
         # --- Reminder controls ---
         elif data.startswith("setreminder:"):
@@ -966,6 +991,7 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db = SessionLocal()
     meetings = db.query(Meeting).filter_by(chat_id=chat_id).all()
+    db.close()
 
     if not meetings:
         await context.bot.send_message(
@@ -975,32 +1001,35 @@ async def list_meetings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for m in meetings:
-        date_str  = m.meet_date.strftime('%b %d') if m.meet_date else "?"
-        time_str  = "?"
+        # Build a brief header for each meeting
+        date_str = m.meet_date.strftime('%b %d') if m.meet_date else "?"
+        time_str = "?"
         place_str = "?"
 
         for line in m.summary.splitlines():
-            if line.strip().startswith("🕒 Time:"):
+            if line.startswith("🕒 Time:"):
                 time_str = line.split("🕒 Time:")[1].strip()
-            elif line.strip().startswith("📍 Place:"):
+            elif line.startswith("📍 Place:"):
                 place_str = line.split("📍 Place:")[1].strip()
 
-        text = f"🆔 *ID {m.id}* | 📅 *{date_str}* | 🕒 *{time_str}* | 📍 *{place_str}*"
+        header = f"🆔 *ID {m.id}* | 📅 *{date_str}* | 🕒 *{time_str}* | 📍 *{place_str}*"
 
-        buttons = [
-            [
-                InlineKeyboardButton("👁️ View",   callback_data=f"view:{m.id}"),
-                InlineKeyboardButton("✏️ Edit",   callback_data=f"edit:{m.id}"),
-                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_prompt:{m.id}")
-            ]
-        ]
+        # Four buttons: View, Edit, Delete, Set Reminder
+        buttons = [[
+            InlineKeyboardButton("👁️ View",         callback_data=f"view:{m.id}"),
+            InlineKeyboardButton("✏️ Edit",         callback_data=f"edit:{m.id}"),
+            InlineKeyboardButton("🗑️ Delete",       callback_data=f"delete_prompt:{m.id}"),
+            InlineKeyboardButton("⏰ Reminder",      callback_data=f"setreminder:{m.id}")
+        ]]
+        markup = InlineKeyboardMarkup(buttons)
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=text,
+            text=header,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            reply_markup=markup
         )
+
 
 
 async def perform_edit_start(user_id, chat_id, meeting_id, context):
